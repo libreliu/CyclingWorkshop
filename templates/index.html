@@ -1,0 +1,630 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>CyclingWorkshop</title>
+  <link rel="stylesheet" href="/static/css/main.css">
+  <link rel="stylesheet" href="/static/lib/leaflet/leaflet.css">
+  <script src="/static/lib/leaflet/leaflet.js"></script>
+  <script src="/static/lib/chart.js/chart.umd.js"></script>
+  <script src="/static/lib/chart.js/hammer.min.js"></script>
+  <script src="/static/lib/chart.js/chartjs-plugin-zoom.umd.js"></script>
+</head>
+<body>
+  <!-- 顶栏 -->
+  <header id="topbar">
+    <div class="logo">🚴 CyclingWorkshop</div>
+    <div class="project-name" id="projectName">未命名项目</div>
+    <div class="topbar-actions">
+      <button onclick="App.newProject()" title="新建项目">新建</button>
+      <button onclick="App.openProject()" title="打开项目">打开</button>
+      <button onclick="App.saveProject()" title="保存项目">保存</button>
+    </div>
+  </header>
+
+  <!-- 步骤导航 -->
+  <nav id="stepnav">
+    <div class="step active" data-step="1" onclick="App.goStep(1)">
+      <span class="step-num">①</span> 数据源
+    </div>
+    <div class="step" data-step="2" onclick="App.goStep(2)">
+      <span class="step-num">②</span> 数据校验
+    </div>
+    <div class="step" data-step="3" onclick="App.goStep(3)">
+      <span class="step-num">③</span> 时间同步
+    </div>
+    <div class="step" data-step="4" onclick="App.goStep(4)">
+      <span class="step-num">④</span> 叠加设计
+    </div>
+    <div class="step" data-step="5" onclick="App.goStep(5)">
+      <span class="step-num">⑤</span> 渲染导出
+    </div>
+    <div class="step tile-mgr" onclick="App.showTileManager()" title="瓦片底图管理">
+      <span>🗺️</span> 瓦片管理
+    </div>
+  </nav>
+
+  <!-- 主工作区 -->
+  <main id="workspace">
+    <!-- Step 1: 数据源 -->
+    <section id="step1" class="step-panel active">
+      <div class="panel-grid">
+        <!-- FIT 面板 -->
+        <div class="panel" id="fitPanel">
+          <div class="loading-overlay" id="fitLoadingOverlay" style="display:none;">
+            <div class="spinner"></div>
+            <div class="loading-text">正在解析 FIT 文件…</div>
+          </div>
+          <h2>📂 FIT 运动数据</h2>
+          <div class="path-input-group">
+            <input type="text" id="fitPathInput" placeholder="输入 FIT 文件本地路径，如 D:\DCIM\data.fit" spellcheck="false">
+            <button onclick="App.browseFitFile()" class="btn-secondary" title="浏览文件">📁</button>
+            <button onclick="App.loadFit()" class="btn-primary">加载</button>
+          </div>
+          <div id="fitStatus" class="status-msg"></div>
+          <div id="fitSummary" class="summary-card" style="display:none;">
+            <div class="summary-row">
+              <span class="summary-icon">🏃</span>
+              <span id="fitSport"></span>
+              <span id="fitStartTime"></span>
+            </div>
+            <div class="summary-stats">
+              <div class="stat"><span class="stat-val" id="fitDistance"></span><span class="stat-unit">km</span></div>
+              <div class="stat"><span class="stat-val" id="fitDuration"></span><span class="stat-unit">时长</span></div>
+              <div class="stat"><span class="stat-val" id="fitAvgSpeed"></span><span class="stat-unit">km/h</span></div>
+              <div class="stat"><span class="stat-val" id="fitAscent"></span><span class="stat-unit">m↑</span></div>
+            </div>
+            <div id="fitFields" class="fields-indicator"></div>
+            <button onclick="App.toggleFitDetail()" class="btn-link">查看详情 ▾</button>
+            <div id="fitDetail" style="display:none;">
+              <div id="fitMap" style="height:300px;margin-top:10px;border-radius:8px;"></div>
+              <div class="chart-row">
+                <canvas id="speedChart" height="150"></canvas>
+              </div>
+              <div class="chart-row">
+                <canvas id="hrChart" height="150"></canvas>
+              </div>
+              <div class="chart-row">
+                <canvas id="altChart" height="150"></canvas>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- 视频面板 -->
+        <div class="panel" id="videoPanel">
+          <div class="loading-overlay" id="videoLoadingOverlay" style="display:none;">
+            <div class="spinner"></div>
+            <div class="loading-text">正在分析视频文件…</div>
+          </div>
+          <h2>🎥 运动相机视频</h2>
+          <div class="path-input-group">
+            <input type="text" id="videoPathInput" placeholder="输入视频文件本地路径，如 D:\DCIM\video.MP4" spellcheck="false">
+            <button onclick="App.browseVideoFile()" class="btn-secondary" title="浏览文件">📁</button>
+            <button onclick="App.loadVideo()" class="btn-primary">加载</button>
+          </div>
+          <div id="videoStatus" class="status-msg"></div>
+          <div id="videoSummary" class="summary-card" style="display:none;">
+            <div class="video-thumb">
+              <img id="videoThumb" alt="视频缩略图">
+            </div>
+            <div class="summary-stats">
+              <div class="stat"><span class="stat-val" id="videoRes"></span><span class="stat-unit">分辨率</span></div>
+              <div class="stat"><span class="stat-val" id="videoFps"></span><span class="stat-unit">fps</span></div>
+              <div class="stat"><span class="stat-val" id="videoDur"></span><span class="stat-unit">时长</span></div>
+              <div class="stat"><span class="stat-val" id="videoCodec"></span><span class="stat-unit">编码</span></div>
+            </div>
+            <div class="advanced-settings">
+              <h3>⚙️ 高级设置</h3>
+              <label>帧率: <input type="number" id="videoFpsOverride" step="0.01" placeholder="自动检测"></label>
+              <label>延时倍率:
+                <select id="timeScaleSelect">
+                  <option value="1">1x (原始)</option>
+                  <option value="2">2x</option>
+                  <option value="4">4x</option>
+                  <option value="10">10x</option>
+                  <option value="15">15x</option>
+                  <option value="30">30x</option>
+                  <option value="custom">自定义</option>
+                </select>
+              </label>
+              <label id="customTimeScaleLabel" style="display:none;">自定义倍率:
+                <input type="number" id="customTimeScale" step="0.1" min="0.1" value="1">
+              </label>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="step-actions">
+        <button onclick="App.goStep(2)" class="btn-primary">下一步：数据校验 →</button>
+      </div>
+    </section>
+
+    <!-- Step 2: 数据校验 -->
+    <section id="step2" class="step-panel">
+      <div class="validation-layout">
+        <!-- 左侧：地图 + 图表 -->
+        <div class="validation-left">
+          <div class="map-container">
+            <div class="map-toolbar">
+              <label>地图源:
+                <select id="mapSourceSelect" onchange="App.switchMapSource(this.value)">
+                  <option value="osm">OpenStreetMap</option>
+                  <option value="carto_dark" selected>CartoDB 暗色</option>
+                  <option value="carto_light">CartoDB 亮色</option>
+                  <option value="stamen_terrain">Stamen 地形</option>
+                  <option value="esri_satellite">ESRI 卫星</option>
+                  <option value="none">无底图（矢量）</option>
+                </select>
+              </label>
+              <button onclick="App.exportGpx()" class="btn-secondary" title="导出 GPX 文件">📥 导出 GPX</button>
+              <span id="filterStatusBadge" class="filter-status-badge" style="display:none;">已滤波</span>
+              <label id="compareToggleLabel" style="display:none;" class="field-check">
+                <input type="checkbox" id="compareToggle" onchange="App.toggleCompare(this.checked)">
+                显示原始轨迹对比
+              </label>
+            </div>
+            <div id="validationMap" style="height:400px;border-radius:8px;"></div>
+          </div>
+          <div class="validation-charts">
+            <canvas id="valSpeedChart" height="120"></canvas>
+            <canvas id="valHrChart" height="120"></canvas>
+            <canvas id="valAltChart" height="120"></canvas>
+          </div>
+        </div>
+
+        <!-- 右侧：数据表格 + 滤波控制 -->
+        <div class="validation-right">
+          <h2>🔍 数据校验与滤波</h2>
+
+          <!-- Step 2-1: 数据清洗（Sanitize）-->
+          <div class="filter-section" id="sanitizeSection">
+            <h3>🧹 数据清洗 — 丢弃不合理记录</h3>
+            <p class="text-muted" style="margin-bottom:8px;">清洗会移除不满足条件的记录行（GPS异常、心率突变等）</p>
+            <div class="filter-controls">
+              <div class="sanitize-grid">
+                <label class="field-check"><input type="checkbox" id="sanGpsGlitch" checked> GPS glitch 过滤</label>
+                <label class="field-check"><input type="checkbox" id="sanGpsRange" checked> GPS 坐标范围检查</label>
+                <label class="field-check"><input type="checkbox" id="sanHrRange" checked> 心率范围检查</label>
+                <label class="field-check"><input type="checkbox" id="sanHrRate" checked> 心率变化率检查</label>
+                <label class="field-check"><input type="checkbox" id="sanSpeedRange" checked> 速度范围检查</label>
+                <label class="field-check"><input type="checkbox" id="sanSpeedAccel" checked> 速度加速度检查</label>
+                <label class="field-check"><input type="checkbox" id="sanAltRange" checked> 海拔范围检查</label>
+                <label class="field-check"><input type="checkbox" id="sanCadRange" checked> 踏频范围检查</label>
+              </div>
+              <details class="sanitize-details">
+                <summary>高级参数</summary>
+                <div class="sanitize-advanced">
+                  <label>GPS 速度阈值(m/s): <input type="number" id="sanGpsMaxSpeed" value="55" step="5" min="10" max="200"></label>
+                  <label>心率范围: <input type="number" id="sanHrMin" value="30" style="width:50px"> ~ <input type="number" id="sanHrMax" value="250" style="width:50px"> bpm</label>
+                  <label>心率变化率(bpm/s): <input type="number" id="sanHrMaxRate" value="30" step="5" min="5" max="100"></label>
+                  <label>速度范围: <input type="number" id="sanSpeedMin" value="0" style="width:50px"> ~ <input type="number" id="sanSpeedMax" value="55" style="width:50px"> m/s</label>
+                  <label>速度加速度(m/s²): <input type="number" id="sanSpeedMaxAccel" value="10" step="1" min="1" max="50"></label>
+                  <label>海拔范围: <input type="number" id="sanAltMin" value="-500" style="width:60px"> ~ <input type="number" id="sanAltMax" value="9000" style="width:60px"> m</label>
+                </div>
+              </details>
+              <div class="filter-actions">
+                <button onclick="App.runSanitize()" class="btn-primary">执行清洗</button>
+                <button onclick="App.resetFilter()" class="btn-danger">重置原始数据</button>
+              </div>
+            </div>
+            <div id="sanitizeResults" class="outlier-results"></div>
+          </div>
+
+          <!-- Step 2-2: 平滑滤波（Smoothing）-->
+          <div class="filter-section">
+            <h3>📊 数据平滑 — 窗函数滤波</h3>
+            <p class="text-muted" style="margin-bottom:8px;">平滑只做数值平滑，不会移除记录行</p>
+            <div class="filter-controls">
+              <label>平滑字段:
+                <div class="field-checkboxes" id="filterFieldChecks">
+                  <!-- 动态生成 -->
+                </div>
+              </label>
+              <label>平滑方法:
+                <select id="filterMethod">
+                  <option value="moving_avg">移动平均</option>
+                  <option value="median">中值滤波</option>
+                  <option value="gaussian">高斯加权</option>
+                </select>
+              </label>
+              <label>窗口大小: <input type="number" id="filterWindow" value="5" min="3" max="21" step="2"></label>
+              <div class="filter-actions">
+                <button onclick="App.applySmooth()" class="btn-primary">应用平滑</button>
+                <button onclick="App.resetFilter()" class="btn-danger">重置原始数据</button>
+              </div>
+            </div>
+          </div>
+
+          <!-- 兼容旧版异常检测（折叠） -->
+          <details class="filter-section" id="outlierSection">
+            <summary><h3 style="display:inline;">⚠️ 异常值检测（旧版 Z-score）</h3></summary>
+            <div class="filter-controls" style="margin-top:8px;">
+              <label>Z-score 阈值: <input type="number" id="outlierSigma" value="3.0" step="0.5" min="1" max="10"></label>
+              <button onclick="App.runOutlierDetection()" class="btn-primary">检测异常</button>
+            </div>
+            <div id="outlierResults" class="outlier-results"></div>
+          </details>
+
+          <!-- 数据表格 -->
+          <div class="data-table-section">
+            <h3>📊 数据点详情 <span id="recordCountLabel" class="text-muted"></span></h3>
+            <div class="table-controls">
+              <input type="text" id="tableSearch" placeholder="搜索/筛选..." oninput="App.filterTable()">
+              <select id="tablePageSize" onchange="App.changeTablePageSize()">
+                <option value="50">50 行</option>
+                <option value="100" selected>100 行</option>
+                <option value="500">500 行</option>
+              </select>
+            </div>
+            <div class="data-table-wrapper" id="dataTableWrapper">
+              <table class="data-table" id="dataTable">
+                <thead>
+                  <tr>
+                    <th>#</th>
+                    <th>时间</th>
+                    <th>纬度</th>
+                    <th>经度</th>
+                    <th>海拔</th>
+                    <th>心率</th>
+                    <th>踏频</th>
+                    <th>速度</th>
+                    <th>距离</th>
+                    <th>功率</th>
+                    <th>温度</th>
+                  </tr>
+                </thead>
+                <tbody id="dataTableBody">
+                  <!-- 动态生成 -->
+                </tbody>
+              </table>
+            </div>
+            <div class="table-pagination" id="tablePagination"></div>
+          </div>
+        </div>
+      </div>
+      <div class="step-actions">
+        <button onclick="App.goStep(1)" class="btn-secondary">← 上一步</button>
+        <button onclick="App.goStep(3)" class="btn-primary">下一步：时间同步 →</button>
+      </div>
+    </section>
+
+    <!-- Step 3: 时间同步 -->
+    <section id="step3" class="step-panel">
+      <div class="panel">
+        <h2>⏱️ 时间同步</h2>
+        <div class="sync-info">
+          <div id="syncFitRange" class="sync-range">FIT 时间范围: --</div>
+          <div id="syncVideoRange" class="sync-range">视频时长: --</div>
+        </div>
+        <div class="sync-mode">
+          <label><input type="radio" name="syncMode" value="auto" checked onchange="App.setSyncMode('auto')"> 自动推断</label>
+          <label><input type="radio" name="syncMode" value="manual" onchange="App.setSyncMode('manual')"> 手动偏移</label>
+          <label><input type="radio" name="syncMode" value="keyframe" onchange="App.setSyncMode('keyframe')"> 关键帧对齐</label>
+        </div>
+        <div id="syncManual" class="sync-config" style="display:none;">
+          <div class="sync-field">
+            <label>🎬 视频录制起始时间:</label>
+            <input type="datetime-local" id="syncVideoStartTime" step="1" oninput="App._updateManualComputed()">
+            <span class="text-muted" id="syncVideoStartHint"></span>
+          </div>
+          <div class="sync-field">
+            <label>⏱️ 微调偏移（秒）:</label>
+            <input type="number" id="syncManualOffset" value="0" step="0.5" style="width:80px;" oninput="App._updateManualComputed()">
+            <span class="text-muted">正值=FIT 时间延后</span>
+          </div>
+          <label>时间缩放: <input type="number" id="syncTimeScale" value="1" step="0.1" min="0.1">x</label>
+          <div class="sync-computed" id="syncManualComputed"></div>
+        </div>
+        <div id="syncAuto" class="sync-config">
+          <p>根据 FIT 文件起始时间和视频文件名/修改时间自动推断视频起始时间。</p>
+          <div id="syncAutoResult"></div>
+        </div>
+        <div id="syncKeyframe" class="sync-config" style="display:none;">
+          <p>在视频和轨迹上分别标记同一位置点，自动计算偏移。</p>
+          <table id="keyframeTable">
+            <thead><tr><th>#</th><th>视频时间(秒)</th><th>FIT 时间</th><th></th></tr></thead>
+            <tbody></tbody>
+          </table>
+          <button onclick="App.addKeyframe()" class="btn-secondary">添加关键帧</button>
+        </div>
+        <div class="sync-preview">
+          <h3>预览验证</h3>
+          <div class="preview-grid">
+            <div class="preview-video">
+              <div id="videoPreviewArea">
+                <img id="videoFramePreview" alt="视频帧预览">
+              </div>
+              <div class="time-slider">
+                <input type="range" id="videoTimeSlider" min="0" max="100" value="0" step="0.1" oninput="App.onVideoTimeChange(this.value)">
+                <span id="videoTimeLabel">00:00</span>
+              </div>
+            </div>
+            <div class="preview-track">
+              <div id="syncMap" style="height:300px;border-radius:8px;"></div>
+              <div id="syncFitTime">FIT: --</div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="step-actions">
+        <button onclick="App.goStep(2)" class="btn-secondary">← 上一步</button>
+        <button onclick="App.goStep(4)" class="btn-primary">下一步：叠加设计 →</button>
+      </div>
+    </section>
+
+    <!-- Step 4: 叠加设计 -->
+    <section id="step4" class="step-panel">
+      <div class="design-layout">
+        <div class="design-canvas-area">
+          <div id="overlayCanvas" class="overlay-canvas">
+            <canvas id="previewCanvas"></canvas>
+            <!-- Widget 叠加层 -->
+            <div id="widgetOverlay"></div>
+          </div>
+          <div class="canvas-controls">
+            <button onclick="App.previewPrevFrame()">◀</button>
+            <button onclick="App.previewPlay()">▶</button>
+            <button onclick="App.previewPause()">⏸</button>
+            <input type="range" id="overlayTimeSlider" min="0" max="100" value="0" step="0.1" oninput="App.onOverlayTimeChange(this.value)">
+            <span id="overlayTimeLabel">00:00</span>
+          </div>
+        </div>
+        <div class="design-panel">
+          <h2>📐 叠加层设计</h2>
+          <label>模板:
+            <select id="templateSelect" onchange="App.selectTemplate(this.value)">
+              <option value="">-- 选择模板 --</option>
+            </select>
+          </label>
+          <div class="widget-list" id="widgetList">
+            <!-- 动态生成 -->
+          </div>
+          <button onclick="App.addWidget()" class="btn-secondary">+ 添加组件</button>
+          <div class="global-settings">
+            <h3>全局设置</h3>
+            <label>背景透明度: <input type="range" id="globalOpacity" min="0" max="1" step="0.05" value="1" oninput="App.setGlobalOpacity(this.value)"></label>
+            <label>整体缩放: <input type="range" id="globalScale" min="50" max="200" value="100" step="5" oninput="App.setGlobalScale(this.value)">%</label>
+          </div>
+        </div>
+      </div>
+      <div class="step-actions">
+        <button onclick="App.goStep(3)" class="btn-secondary">← 上一步</button>
+        <button onclick="App.goStep(5)" class="btn-primary">下一步：渲染导出 →</button>
+      </div>
+    </section>
+
+    <!-- Step 5: 渲染导出 -->
+    <section id="step5" class="step-panel">
+      <div class="panel">
+        <h2>🎬 渲染导出</h2>
+        <div class="render-settings">
+          <label>输出路径: <input type="text" id="outputPath" placeholder="输出视频路径" style="width:60%;" spellcheck="false"></label>
+          <div class="render-row">
+            <label>编码: <select id="renderCodec"><option value="libx264">H.264</option></select></label>
+            <label>预设: <select id="renderPreset">
+              <option value="ultrafast">ultrafast</option>
+              <option value="veryfast">veryfast</option>
+              <option value="fast">fast</option>
+              <option value="medium" selected>medium</option>
+              <option value="slow">slow</option>
+            </select></label>
+            <label>CRF: <input type="number" id="renderCrf" value="20" min="0" max="51" step="1"></label>
+          </div>
+          <div class="render-row">
+            <label><input type="radio" name="renderAudio" value="copy" checked> 保留原始音频</label>
+            <label><input type="radio" name="renderAudio" value="none"> 无音频</label>
+          </div>
+          <div class="render-row">
+            <label title="仅输出 overlay 层（保留 Alpha 透明通道），适合后期在剪辑软件中自行编辑合成">
+              <input type="checkbox" id="renderOverlayOnly"> 仅输出 Overlay 层
+            </label>
+            <select id="renderOverlayCodec" style="display:none; margin-left:8px;" title="Overlay 输出格式">
+              <option value="qtrle">MOV (qtrle 无损)</option>
+              <option value="libvpx-vp9">WebM (VP9)</option>
+            </select>
+          </div>
+          <div class="render-row">
+            <label><input type="radio" name="renderRange" value="all" checked> 全部</label>
+            <label><input type="radio" name="renderRange" value="custom"> 自定义范围</label>
+          </div>
+          <div id="renderRangeCustom" class="render-row" style="display:none;">
+            <label>起始: <input type="text" id="renderStart" value="00:00:00"></label>
+            <label>结束: <input type="text" id="renderEnd" value="00:00:00"></label>
+          </div>
+        </div>
+        <div id="renderProgress" class="render-progress" style="display:none;">
+          <div class="progress-bar">
+            <div class="progress-fill" id="progressFill"></div>
+          </div>
+          <div class="progress-stats">
+            <span id="progressPercent">0%</span>
+            <span id="progressFrames">0/0 帧</span>
+            <span id="progressOverlaySpeed" title="帧 overlay 生成速度">🎨 -- fps</span>
+            <span id="progressEncodeSpeed" title="编码速度">🎬 -- fps</span>
+            <span id="progressEta">预计剩余: --</span>
+          </div>
+          <div class="progress-detail" id="progressDetail"></div>
+          <button onclick="App.cancelRender()" class="btn-danger">❌ 取消渲染</button>
+          <!-- ffmpeg 命令回显 -->
+          <div id="renderCmdContainer" class="render-cmd-container" style="display:none;">
+            <div class="render-cmd-header" onclick="App._toggleRenderCmd()">
+              <span>🔧 ffmpeg 命令</span>
+              <span id="renderCmdToggle" class="render-cmd-toggle">▼</span>
+            </div>
+            <div id="renderCmdBody" class="render-cmd-body" style="display:none;"></div>
+          </div>
+          <!-- ffmpeg 实时日志 -->
+          <div class="render-log-header" onclick="App._toggleRenderLog()">
+            <span>📋 ffmpeg 日志</span>
+            <span id="renderLogCount" class="render-log-count">0 条</span>
+            <span id="renderLogToggle" class="render-cmd-toggle">▼</span>
+          </div>
+          <div id="renderLogContainer" class="render-log-container">
+            <div class="render-log-toolbar">
+              <button onclick="event.stopPropagation(); App._clearRenderLog()" class="btn-link" title="清除日志" style="font-size:11px;">🗑️ 清除</button>
+              <button onclick="event.stopPropagation(); App._copyRenderLog()" class="btn-link" title="复制日志" style="font-size:11px;">📋 复制</button>
+              <label style="font-size:11px; margin-left:auto; color:#8899aa;">
+                <input type="checkbox" id="renderLogAutoScroll" checked> 自动滚动
+              </label>
+            </div>
+            <div class="render-log-panel" id="renderLogPanel"></div>
+          </div>
+        </div>
+      </div>
+      <div class="step-actions">
+        <button onclick="App.goStep(4)" class="btn-secondary">← 上一步</button>
+        <button onclick="App.startRender()" class="btn-primary" id="startRenderBtn">▶ 开始渲染</button>
+      </div>
+    </section>
+
+    <!-- 瓦片底图管理 -->
+    <section id="tileManagerPanel" class="step-panel">
+      <div class="tile-manager-page">
+        <!-- 代理配置 -->
+        <div class="tile-section">
+          <h2>🌐 代理配置</h2>
+          <p class="text-muted" style="margin-bottom:12px;">在公司或受限网络环境下，可通过代理下载瓦片底图</p>
+          <div id="proxyFormContainer"></div>
+        </div>
+
+        <!-- 缓存管理 -->
+        <div class="tile-section">
+          <h2>💾 瓦片缓存</h2>
+          <div id="cacheInfoContainer"></div>
+        </div>
+
+        <!-- 缓存可视化 -->
+        <div class="tile-section">
+          <h2>🗺️ 缓存可视化</h2>
+          <p class="text-muted" style="margin-bottom:8px;">在地图上查看已缓存瓦片覆盖范围。按住 <kbd>Shift</kbd> + 拖拽选择下载区域</p>
+          <div id="cacheMap" style="height:400px; border-radius:8px; border:1px solid #333;"></div>
+          <div class="region-download-form" style="margin-top:12px;">
+            <div class="preload-row">
+              <label>选定区域: <span id="regionBounds" class="text-muted">未选择（在地图上 Shift+拖拽 选择）</span></label>
+              <button onclick="TileManager.clearRegionSelect()" class="btn-secondary btn-sm">清除选区</button>
+            </div>
+            <input type="hidden" id="regionMinLat">
+            <input type="hidden" id="regionMaxLat">
+            <input type="hidden" id="regionMinLon">
+            <input type="hidden" id="regionMaxLon">
+            <div class="preload-row" style="margin-top:8px;">
+              <label>底图样式:
+                <select id="regionStyle">
+                  <option value="carto_dark">CartoDB 暗色</option>
+                  <option value="carto_light">CartoDB 亮色</option>
+                  <option value="osm">OpenStreetMap</option>
+                  <option value="stamen_terrain">Stamen 地形</option>
+                  <option value="esri_satellite">ESRI 卫星</option>
+                </select>
+              </label>
+              <label>缩放级别: <input type="number" id="regionZoom" value="0" min="0" max="18" step="1"> <small class="text-muted">(0=自动)</small></label>
+              <button onclick="TileManager.downloadRegion()" class="btn-primary">下载选区</button>
+            </div>
+          </div>
+        </div>
+
+        <!-- 预下载 -->
+        <div class="tile-section">
+          <h2>📥 瓦片预下载</h2>
+          <p class="text-muted" style="margin-bottom:12px;">提前下载轨迹区域所需的瓦片，避免渲染时等待</p>
+          <div id="preloadFormContainer"></div>
+        </div>
+
+        <!-- 下载进度 -->
+        <div class="tile-section">
+          <h2>📊 下载进度</h2>
+          <div id="taskListContainer">
+            <p class="text-muted">暂无下载任务</p>
+          </div>
+        </div>
+      </div>
+      <div class="step-actions">
+        <button onclick="App.closeTileManager()" class="btn-secondary">← 返回工作流</button>
+      </div>
+    </section>
+  </main>
+
+  <!-- Widget 编辑弹窗 -->
+  <div id="widgetEditModal" class="modal" style="display:none;">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h3 id="widgetEditTitle">编辑组件</h3>
+        <button onclick="App.closeWidgetEdit()" class="btn-close">&times;</button>
+      </div>
+      <div class="modal-body" id="widgetEditBody">
+        <!-- 动态生成 -->
+      </div>
+      <div class="modal-footer">
+        <button onclick="App.closeWidgetEdit()" class="btn-secondary">取消</button>
+        <button onclick="App.saveWidgetEdit()" class="btn-primary">确定</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Widget 添加弹窗 -->
+  <div id="addWidgetModal" class="modal" style="display:none;">
+    <div class="modal-content" style="max-width:500px;">
+      <div class="modal-header">
+        <h3>添加组件</h3>
+        <button onclick="App.closeAddWidget()" class="btn-close">&times;</button>
+      </div>
+      <div class="modal-body" id="addWidgetBody">
+        <!-- 动态生成 -->
+      </div>
+      <div class="modal-footer">
+        <button onclick="App.closeAddWidget()" class="btn-secondary">取消</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 项目列表弹窗 -->
+  <div id="projectListModal" class="modal" style="display:none;">
+    <div class="modal-content" style="max-width:600px; max-height:80vh;">
+      <div class="modal-header">
+        <h3>📂 打开项目</h3>
+        <button onclick="document.getElementById('projectListModal').style.display='none'" class="btn-close">&times;</button>
+      </div>
+      <div id="projectListContent" style="max-height:60vh; overflow-y:auto; padding:12px;">
+      </div>
+    </div>
+  </div>
+
+  <!-- 文件浏览弹窗 -->
+  <div id="fileBrowseModal" class="modal" style="display:none;">
+    <div class="modal-content" style="max-width:700px; max-height:80vh;">
+      <div class="modal-header">
+        <h3 id="fileBrowseTitle">浏览文件</h3>
+        <button onclick="App.closeFileBrowse()" class="btn-close">&times;</button>
+      </div>
+      <div class="modal-body" style="overflow-y:auto; max-height:60vh; padding:0;">
+        <div class="file-browser">
+          <div class="fb-path-bar">
+            <input type="text" id="fbPathBar" placeholder="路径" spellcheck="false"
+              onkeydown="if(event.key==='Enter') App.fbNavigate(this.value)">
+          </div>
+          <div class="fb-toolbar">
+            <button onclick="App.fbGoUp()" class="btn-secondary" title="上级目录">⬆ 上级</button>
+            <button onclick="App.fbRefresh()" class="btn-secondary" title="刷新">🔄</button>
+          </div>
+          <div id="fbContent" class="fb-content">
+            <!-- 动态生成 -->
+          </div>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button onclick="App.closeFileBrowse()" class="btn-secondary">取消</button>
+        <button onclick="App.fbSelect()" class="btn-primary" id="fbSelectBtn">选择</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Toast 通知 -->
+  <div id="toastContainer"></div>
+
+  <script src="/static/js/api.js"></script>
+  <script src="/static/js/tile_manager.js"></script>
+  <script src="/static/js/app.js"></script>
+</body>
+</html>

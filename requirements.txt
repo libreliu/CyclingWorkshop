@@ -1,0 +1,10 @@
+flask>=3.0
+flask-socketio>=5.3
+fit-tool>=0.1
+python-ffmpeg>=2.0
+Pillow>=10.0
+requests>=2.31
+geopy>=2.4
+eventlet>=0.36
+av>=12.0
+numpy>=1.24
