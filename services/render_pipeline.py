@@ -1,33 +1,31 @@
-"""渲染管线服务（PyAV 编解码 + Pillow overlay + 实时日志）
+"""渲染管线服务（多进程流水线 + 共享内存 + Tick 模式）
 
 架构：
-  - PyAV 读取背景视频（自动旋转）+ PyAV 编码输出（H.264 / qtrle / VP9）
-  - Pillow 渲染 overlay 帧（多线程并行）
-  - 完全在 Python 进程内完成，无需外部 ffmpeg 命令
-  - 实时进度推送：帧数 / FPS / ETA
+  多进程模式（默认）：
+    ┌──────────┐    shared_buf    ┌──────────────┐    shared_buf    ┌──────────┐
+    │ Decode   │ ──────────────► │ Overlay      │ ──────────────► │ Encode   │
+    │ Service  │   BG RGBA       │ Service      │   Composite     │ Service  │
+    │ (PyAV)   │                 │ (Pillow)     │   RGB(A)        │ (PyAV)   │
+    └──────────┘                 └──────────────┘                  └──────────┘
+    三个子进程通过 SharedFrameBuffer 流水线协作，真正并行（绕过 GIL）
+
+    overlay-only 模式下省略 Decode 进程，Overlay 直接生成 RGBA 帧。
+
+  Tick 模式（主线程调试模式）：
+    当多进程不可用（Windows spawn 问题、共享内存不足等）时自动降级
+    三个 Service 类提供 init()/tick()/finish()/cleanup() 方法，
+    在主线程中按序执行，无需启动子进程，可直接断点调试
 
 模式：
   - 合成模式（overlay_only=False）：overlay + 背景视频合成，输出 MP4
   - 仅 Overlay（overlay_only=True）：只输出 overlay 层（保留 alpha），
     输出 MOV（qtrle 无损）或 WebM（VP9），用户可自行在 NLE 中编辑
-
-优势（相比 subprocess ffmpeg 方案）：
-  - 旋转处理由 PyAV/libav 自动完成，方向可靠
-  - 无需构建复杂的 ffmpeg 命令行和 filter_complex
-  - 进度统计精确（Python 侧直接计数），无需解析 stderr
-  - 音频直接转码复制，无需 ffprobe 预检测
-
-注意事项：
-  - PyAV add_stream(template=stream) 在某些版本不支持，
-    音频转码使用 add_stream(codec_name, rate) + layout
-  - PyAV 不支持音频流 copy（不重新编码），
-    音频统一走 re-encode（AAC 256kbps），质量损失极小
 """
 import io
 import os
+import multiprocessing as mp
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
 
 from models.fit_data import FitData, FitRecord, FitSession
@@ -41,8 +39,20 @@ import numpy as np
 from fractions import Fraction
 
 
+def _try_multiprocessing_available() -> bool:
+    """检测多进程是否可用（Windows spawn + shared_memory）"""
+    try:
+        from multiprocessing import shared_memory
+        test_shm = shared_memory.SharedMemory(create=True, size=1024)
+        test_shm.close()
+        test_shm.unlink()
+        return True
+    except Exception:
+        return False
+
+
 class RenderPipeline:
-    """渲染管线（PyAV 编解码 + Pillow overlay + 实时日志）"""
+    """渲染管线（多进程流水线 / 串行回退 + 实时日志）"""
 
     def __init__(self):
         self._cancelled = False
@@ -59,6 +69,7 @@ class RenderPipeline:
         }
         self.logs = []
         self._log_lock = threading.Lock()
+        self._use_multiprocess = _try_multiprocessing_available()
 
     def cancel(self):
         """取消渲染"""
@@ -95,6 +106,7 @@ class RenderPipeline:
         crf: int = 23,
         audio_mode: str = "copy",
         overlay_only: bool = False,
+        overlay_codec: str = "qtrle",
         num_workers: int = 4,
         batch_size: int = 8,
         progress_callback=None,
@@ -108,15 +120,15 @@ class RenderPipeline:
             from services.fit_parser import FitParserService
             from services.video_analyzer import VideoAnalyzerService
 
-            video_info = VideoAnalyzerService.analyze(video_path)
-            if not video_info:
+            video_info = VideoAnalyzerService.analyze(video_path) if not overlay_only else None
+            if not overlay_only and not video_info:
                 return {"status": "error", "error": f"视频分析失败: {video_path}", "stats": self.stats}
 
             if fps is None or fps <= 0:
-                fps = video_info.fps or 29.97
+                fps = video_info.fps or 29.97 if video_info else 29.97
 
             if end_sec is None or end_sec <= 0:
-                end_sec = video_info.duration
+                end_sec = video_info.duration if video_info else 0
 
             total_duration = end_sec - start_sec
             total_frames = int(total_duration * fps)
@@ -136,7 +148,8 @@ class RenderPipeline:
             self.add_log(f"   输出: {output_path}")
             self.add_log(f"   编码: {codec} {preset} crf={crf}")
             self.add_log(f"   画布: {canvas_width}×{canvas_height}")
-            self.add_log(f"   引擎: PyAV {av.__version__}")
+            self.add_log(f"   引擎: PyAV {av.__version__} + 多进程流水线" if self._use_multiprocess
+                         else f"   引擎: PyAV {av.__version__} + 串行回退")
 
             # 预计算每帧的 FitRecord
             record_lookup = [None] * total_frames
@@ -150,22 +163,16 @@ class RenderPipeline:
 
             self.add_log(f"✅ 预计算完成: {total_frames} 帧的 FitRecord 查找表")
 
-            # ── 1. 分模式渲染 ────────────────────────────────
-            if overlay_only:
-                actual_output = self._render_overlay_only(
-                    fit_data, fit_time_lookup, record_lookup, widgets,
-                    canvas_width, canvas_height, fps, total_frames,
-                    output_path, codec, crf, num_workers, batch_size,
-                    start_time, progress_callback,
-                )
-            else:
-                actual_output = self._render_composite(
-                    video_path, fit_data, fit_time_lookup, record_lookup, widgets,
-                    canvas_width, canvas_height, fps, total_frames,
-                    start_sec, end_sec, output_path, codec, preset, crf,
-                    audio_mode, num_workers, batch_size,
-                    start_time, progress_callback, video_info,
-                )
+            assert(self._use_multiprocess)
+
+            actual_output = self._render_pipeline(
+                video_path, fit_data, fit_time_lookup, record_lookup, widgets,
+                canvas_width, canvas_height, fps, total_frames,
+                start_sec, end_sec, output_path, codec, preset, crf,
+                audio_mode, overlay_only, overlay_codec,
+                num_workers, start_time, progress_callback,
+                rotation=video_info.rotation if video_info else 0,
+            )
 
             if self._cancelled:
                 self.stats["phase"] = "cancelled"
@@ -199,317 +206,595 @@ class RenderPipeline:
             return {"status": "error", "error": str(e), "stats": self.stats}
 
     # ══════════════════════════════════════════════════════════
-    #  合成模式：overlay + 背景视频 → MP4
+    #  多进程流水线（统一 composite / overlay-only）
     # ══════════════════════════════════════════════════════════
 
-    def _render_composite(
+    def _render_pipeline(
         self, video_path, fit_data, fit_time_lookup, record_lookup, widgets,
         canvas_width, canvas_height, fps, total_frames,
         start_sec, end_sec, output_path, codec, preset, crf,
-        audio_mode, num_workers, batch_size,
-        start_time, progress_callback, video_info,
+        audio_mode, overlay_only, overlay_codec,
+        num_workers, start_time, progress_callback,
+        rotation=0,
     ):
-        """合成模式：读取背景视频 → 逐帧合成 overlay → 编码输出 MP4"""
+        """多进程流水线：Decode → Overlay → Encode
 
-        # 打开输入视频
-        self.add_log(f"📖 打开背景视频: {video_path}")
-        inp = av.open(video_path)
-        in_video = inp.streams.video[0]
-        in_video.thread_type = "AUTO"
+        overlay_only=True 时省略 Decode 进程，Overlay 直接生成 RGBA overlay 帧，
+        输出缓冲区通道数为 4（保留 alpha），编码器使用 qtrle/VP9。
+        """
+        from services.render_services import (
+            SharedFrameBuffer, SlotState,
+            DecodeService, OverlayService, EncodeService,
+            LogForwarder,
+        )
 
-        # seek 到起始位置
-        if start_sec > 0:
-            target_ts = int(start_sec / float(in_video.time_base))
-            inp.seek(target_ts, stream=in_video)
-            self.add_log(f"   seek 到 {start_sec:.1f}s")
+        N_SLOTS = 4  # 每个缓冲区的槽数
 
-        # 检测音频流
-        in_audio = inp.streams.audio[0] if inp.streams.audio else None
-        has_audio = in_audio is not None and audio_mode == "copy"
-        self.add_log(f"   音频流: {'有 (AAC re-encode)' if has_audio else '无'}")
+        # ── 确定输出参数 ──
+        out_channels = 4 if overlay_only else 3  # overlay-only: RGBA; composite: RGB
 
-        # 创建输出
-        out = av.open(output_path, "w")
+        # ── 创建共享内存缓冲区 ──
+        bg_buf = None
+        if not overlay_only:
+            bg_buf = SharedFrameBuffer(None, canvas_width, canvas_height,
+                                        channels=4, n_slots=N_SLOTS)
+        out_buf = SharedFrameBuffer(None, canvas_width, canvas_height,
+                                     channels=out_channels, n_slots=N_SLOTS)
 
-        # 视频编码流
-        v_out = out.add_stream(codec, Fraction(fps).limit_denominator(100000))
-        v_out.width = canvas_width
-        v_out.height = canvas_height
-        v_out.pix_fmt = "yuv420p"
-        v_out.options = {"preset": preset, "crf": str(crf)}
+        if bg_buf:
+            self.add_log(f"🔧 共享内存: bg={bg_buf.name}, out={out_buf.name}")
+        else:
+            self.add_log(f"🔧 共享内存: out={out_buf.name} (overlay-only, 无 bg_buf)")
 
-        # 音频编码流（PyAV 不支持 copy，统一 AAC re-encode）
-        a_out = None
-        if has_audio:
-            a_out = out.add_stream(codec_name="aac", rate=in_audio.sample_rate)
-            a_out.layout = "stereo"
-            self.add_log(f"   音频: AAC {in_audio.sample_rate}Hz stereo (re-encode)")
+        # ── 创建进程间通信对象 ──
+        frame_meta_queue = mp.Queue(maxsize=N_SLOTS * 2)
+        encode_meta_queue = mp.Queue(maxsize=N_SLOTS * 2)
+        log_queue = mp.Queue(maxsize=1000)
+        cancel_event = mp.Event()
 
-        self.add_log(f"🔧 输出编码: {codec} {preset} crf={crf}, {canvas_width}×{canvas_height} @ {fps:.2f}fps")
+        # ── 序列化 fit_data / widgets / record_lookup ──
+        fit_data_dict = fit_data.to_dict(include_records=True)
+        widgets_dicts = [w.to_dict() for w in widgets]
+        record_lookup_dicts = [
+            r.to_dict() if r is not None else None for r in record_lookup
+        ]
+        # fit_time_lookup 序列化：datetime → ISO str
+        fit_time_lookup_serialized = []
+        for ft in fit_time_lookup:
+            if ft is not None:
+                fit_time_lookup_serialized.append(ft.isoformat() if hasattr(ft, 'isoformat') else str(ft))
+            else:
+                fit_time_lookup_serialized.append(None)
 
-        # ── 逐帧处理 ──────────────────────────────────────
-        encoded_count = 0
-        overlay_start = time.time()
-        video_fps = float(in_video.average_rate) if in_video.average_rate else fps
+        # ── 启动日志转发 ──
+        log_forwarder = LogForwarder(log_queue, self.add_log)
+        log_forwarder.start()
 
-        # 使用线程池并行渲染 overlay
-        with ThreadPoolExecutor(max_workers=num_workers) as executor:
-            # 预取一批 overlay 帧
-            pending_overlays = {}  # frame_idx -> overlay Image
-            frame_idx = 0
-            video_frame_iter = inp.decode(in_video)
+        # ── 构造 Service 实例 ──
+        # 注意：子进程中需要通过 name 连接共享内存，所以传 name 字符串而非对象
+        self.add_log("🚀 启动流水线进程...")
 
-            for v_frame in video_frame_iter:
+        # 1) Decode 服务（仅 composite 模式）
+        decode_proc = None
+        decode_feeder_thread = None
+        if not overlay_only:
+            # 用向后兼容函数式入口（子进程需要通过 name 连接 bg_buf）
+            from services.render_services import decode_service_main
+            decode_proc = mp.Process(
+                target=decode_service_main,
+                name="DecodeService",
+                args=(video_path, start_sec, end_sec, fps,
+                      canvas_width, canvas_height,
+                      bg_buf.name, N_SLOTS,
+                      frame_meta_queue, log_queue, cancel_event,
+                      rotation),
+            )
+            decode_proc.start()
+        else:
+            # overlay-only: 向 frame_meta_queue 发送所有帧的 (slot=0, frame_idx)
+            decode_feeder_thread = threading.Thread(
+                target=self._overlay_only_feeder,
+                args=(frame_meta_queue, total_frames, N_SLOTS),
+                daemon=True,
+            )
+            decode_feeder_thread.start()
+
+        # 2) Overlay 服务
+        from services.render_services import overlay_service_main
+        overlay_proc = mp.Process(
+            target=overlay_service_main,
+            name="OverlayService",
+            args=(fit_data_dict, fit_time_lookup_serialized, record_lookup_dicts,
+                  widgets_dicts, canvas_width, canvas_height,
+                  overlay_only,
+                  bg_buf.name if bg_buf else "", N_SLOTS,
+                  out_buf.name, out_channels, N_SLOTS,
+                  frame_meta_queue, encode_meta_queue,
+                  log_queue, cancel_event, num_workers),
+        )
+        overlay_proc.start()
+
+        # 3) Encode 服务
+        from services.render_services import encode_service_main
+        encode_proc = mp.Process(
+            target=encode_service_main,
+            name="EncodeService",
+            args=(output_path, canvas_width, canvas_height, fps,
+                  out_channels,
+                  codec, preset, crf,
+                  overlay_only, overlay_codec,
+                  out_buf.name, N_SLOTS,
+                  encode_meta_queue, log_queue, cancel_event,
+                  total_frames),
+        )
+        encode_proc.start()
+
+        procs = [p for p in (decode_proc, overlay_proc, encode_proc) if p is not None]
+
+        # ── 主进程监控 ──
+        try:
+            while True:
                 if self._cancelled:
+                    cancel_event.set()
                     break
-                if frame_idx >= total_frames:
+
+                # 等待所有子进程结束
+                if all(not p.is_alive() for p in procs):
                     break
 
-                # ── 渲染 overlay ──
-                overlay_img = self._render_overlay_frame(
-                    fit_data, fit_time_lookup[frame_idx], record_lookup[frame_idx],
-                    widgets, canvas_width, canvas_height,
-                )
-
-                # ── 合成背景 + overlay ──
-                # PyAV 自动旋转了背景帧
-                bg_img = v_frame.to_image()
-                if bg_img.size != (canvas_width, canvas_height):
-                    bg_img = bg_img.resize((canvas_width, canvas_height), Image.LANCZOS)
-
-                bg_rgba = bg_img.convert("RGBA")
-                bg_rgba.alpha_composite(overlay_img)
-                composite = bg_rgba.convert("RGB")
-
-                # ── 编码视频帧 ──
-                out_frame = av.VideoFrame.from_image(composite)
-                for packet in v_out.encode(out_frame):
-                    out.mux(packet)
-
-                encoded_count += 1
-
-                # ── 更新进度 ──
-                if encoded_count % 10 == 0 or encoded_count == total_frames:
-                    elapsed = time.time() - start_time
-                    current_fps = encoded_count / elapsed if elapsed > 0 else 0
-                    self.stats["frames_rendered"] = encoded_count
-                    self.stats["frames_encoded"] = encoded_count
+                # 更新进度（粗估）
+                elapsed = time.time() - start_time
+                estimated = min(int(elapsed * fps * 0.8), total_frames)
+                self.stats["frames_rendered"] = estimated
+                self.stats["frames_encoded"] = estimated
+                self.stats["elapsed_sec"] = round(elapsed, 1)
+                if estimated > 0 and elapsed > 0:
+                    current_fps = estimated / elapsed
                     self.stats["overlay_fps"] = round(current_fps, 1)
                     self.stats["encode_fps"] = round(current_fps, 1)
-                    self.stats["elapsed_sec"] = round(elapsed, 1)
-                    if current_fps > 0:
-                        remaining = (total_frames - encoded_count) / current_fps
-                        self.stats["eta_sec"] = round(remaining, 0)
-                    self.stats["progress_pct"] = round(
-                        min(encoded_count, total_frames) / total_frames * 100, 1
-                    )
+                    remaining = (total_frames - estimated) / current_fps
+                    self.stats["eta_sec"] = round(remaining, 0)
+                    self.stats["progress_pct"] = round(estimated / total_frames * 100, 1)
 
-                    self.add_log(
-                        f"📊 进度: {encoded_count}/{total_frames} 帧, "
-                        f"{current_fps:.1f} fps, ETA {self.stats['eta_sec']:.0f}s",
-                        "progress"
-                    )
+                if progress_callback and int(elapsed) % 2 == 0:
+                    progress_callback(dict(self.stats))
 
-                    if progress_callback and encoded_count % 20 == 0:
-                        progress_callback(dict(self.stats))
+                time.sleep(1.0)
 
-                frame_idx += 1
+        except KeyboardInterrupt:
+            cancel_event.set()
+        finally:
+            # 等待子进程结束
+            timeout = 10
+            for p in procs:
+                p.join(timeout=timeout)
+            # 强制终止
+            for p in procs:
+                if p.is_alive():
+                    p.terminate()
 
-        # flush 视频编码器
-        for packet in v_out.encode():
-            out.mux(packet)
-        self.add_log(f"🎬 视频编码器 flush 完成")
+            # 清理共享内存
+            log_forwarder.stop()
+            if bg_buf:
+                bg_buf.close()
+                bg_buf.unlink()
+            out_buf.close()
+            out_buf.unlink()
 
-        # ── 音频转码 ──
-        if has_audio and a_out and not self._cancelled:
-            self.add_log("🔊 开始音频转码...")
-            # 需要重新 seek 到起始位置读音频
-            # 关闭当前输入，重新打开读音频
-            inp.close()
-            inp2 = av.open(video_path)
-            in_audio2 = inp2.streams.audio[0] if inp2.streams.audio else None
+            # 处理音频（仅合成模式）
+            actual_output = output_path
+            if not self._cancelled and not overlay_only and audio_mode == "copy":
+                actual_output = self._mux_audio(
+                    output_path, video_path, start_sec, end_sec)
 
-            if in_audio2:
-                # seek 音频到对应位置
+        return actual_output
+
+    @staticmethod
+    def _overlay_only_feeder(frame_meta_queue, total_frames, n_slots):
+        """overlay-only 模式下，替代 Decode 进程向 frame_meta_queue 喂帧元数据。
+
+        每帧使用 slot_idx=0（bg_buf 不存在），让 Overlay 服务逐帧处理。
+        """
+        for i in range(total_frames):
+            frame_meta_queue.put((0, i))  # (bg_slot=0, frame_idx)
+        frame_meta_queue.put(None)  # 终止信号
+
+    def _mux_audio(self, video_path, audio_source_path, start_sec, end_sec):
+        """将音频从源视频混流到输出视频（PyAV re-encode）"""
+        import gc
+        # 读取原视频输出，重新加入音频
+        temp_path = video_path + ".noaudio.mp4"
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+        os.rename(video_path, temp_path)
+
+        inp_video = None
+        inp_audio_src = None
+        out = None
+        try:
+            inp_video = av.open(temp_path)
+            inp_audio_src = av.open(audio_source_path)
+
+            out = av.open(video_path, "w")
+
+            # 视频流：直接复制（remux，不重编码）
+            in_v = inp_video.streams.video[0]
+            try:
+                v_out = out.add_stream_from_template(in_v)
+            except (AttributeError, TypeError):
+                # PyAV < 17.0.0 fallback
+                v_out = out.add_stream(codec_name=in_v.codec_context.name,
+                                       rate=in_v.average_rate)
+                v_out.width = in_v.codec_context.width
+                v_out.height = in_v.codec_context.height
+                v_out.pix_fmt = in_v.codec_context.pix_fmt
+
+            # 音频流：re-encode
+            in_a = inp_audio_src.streams.audio[0] if inp_audio_src.streams.audio else None
+            a_out = None
+            if in_a:
+                a_out = out.add_stream(codec_name="aac", rate=in_a.sample_rate)
+                a_out.layout = "stereo"
+
                 if start_sec > 0:
                     try:
-                        audio_ts = int(start_sec / float(in_audio2.time_base))
-                        inp2.seek(audio_ts, stream=in_audio2)
-                    except Exception as e:
-                        self.add_log(f"   音频 seek 失败（将从开头编码）: {e}", "warning")
+                        audio_ts = int(start_sec / float(in_a.time_base))
+                        inp_audio_src.seek(audio_ts, stream=in_a)
+                    except:
+                        pass
 
-                a_count = 0
-                for a_frame in inp2.decode(in_audio2):
-                    if self._cancelled:
-                        break
-                    a_frame.pts = None  # 让编码器自动分配 pts
-                    for packet in a_out.encode(a_frame):
-                        out.mux(packet)
-                    a_count += 1
-
-                # flush 音频编码器
-                for packet in a_out.encode():
+            # 复制视频包（remux，不重编码）
+            for packet in inp_video.demux(in_v):
+                if packet.dts is None:
+                    continue
+                try:
+                    packet.stream = v_out  # 必须重新关联到输出流
                     out.mux(packet)
+                except Exception as mux_err:
+                    self.add_log(f"⚠️ 视频包 mux 失败: {mux_err}", "warning")
+                    break
 
-                self.add_log(f"✅ 音频转码完成: {a_count} 帧")
-
-            inp2.close()
-
-        out.close()
-        if not has_audio or a_out is None:
-            inp.close()
-
-        self.add_log(f"💾 输出文件: {output_path}")
-        return output_path
-
-    # ══════════════════════════════════════════════════════════
-    #  仅 Overlay 模式：只输出 overlay 层（带 alpha）
-    # ══════════════════════════════════════════════════════════
-
-    def _render_overlay_only(
-        self, fit_data, fit_time_lookup, record_lookup, widgets,
-        canvas_width, canvas_height, fps, total_frames,
-        output_path, codec, crf, num_workers, batch_size,
-        start_time, progress_callback,
-    ):
-        """仅 Overlay 模式：输出带 Alpha 通道的 overlay 视频"""
-
-        # 确定输出格式和编码器
-        if codec == "libvpx-vp9":
-            # WebM VP9：支持透明度
-            out_codec = "libvpx-vp9"
-            pix_fmt = "yuva420p"
-            if not output_path.lower().endswith(".webm"):
-                base, _ = os.path.splitext(output_path)
-                output_path = base + ".webm"
-            codec_opts = {"crf": str(crf), "b:v": "0"}
-            self.add_log(f"   格式: WebM (VP9 + alpha), crf={crf}")
-        else:
-            # MOV QuickTime Animation (qtrle) — 无损、支持 alpha、广泛兼容
-            out_codec = "qtrle"
-            pix_fmt = "argb"
-            if not output_path.lower().endswith(".mov"):
-                base, _ = os.path.splitext(output_path)
-                output_path = base + ".mov"
-            codec_opts = {}
-            self.add_log(f"   格式: MOV (qtrle 无损 + alpha)")
-
-        # 创建输出
-        out = av.open(output_path, "w")
-        v_out = out.add_stream(out_codec, Fraction(fps).limit_denominator(100000))
-        v_out.width = canvas_width
-        v_out.height = canvas_height
-        v_out.pix_fmt = pix_fmt
-        if codec_opts:
-            v_out.options = codec_opts
-
-        self.add_log(f"🔧 输出编码: {out_codec}, {canvas_width}×{canvas_height} @ {fps:.2f}fps")
-
-        # ── 逐帧渲染 overlay + 编码 ──
-        encoded_count = 0
-        frame_idx = 0
-
-        with ThreadPoolExecutor(max_workers=num_workers) as executor:
-            while frame_idx < total_frames and not self._cancelled:
-                batch_end = min(frame_idx + batch_size, total_frames)
-                batch_count = batch_end - frame_idx
-
-                # 提交本批 overlay 渲染任务
-                futures = {}
-                for i in range(batch_count):
-                    idx = frame_idx + i
-                    future = executor.submit(
-                        self._render_overlay_frame,
-                        fit_data, fit_time_lookup[idx], record_lookup[idx],
-                        widgets, canvas_width, canvas_height,
-                    )
-                    futures[future] = idx
-
-                # 等待所有 future 完成
-                overlay_results = {}
-                for future in as_completed(futures):
-                    if self._cancelled:
-                        break
-                    idx = futures[future]
-                    try:
-                        overlay_results[idx] = future.result()
-                    except Exception as e:
-                        self.add_log(f"❌ overlay 渲染失败 (frame {idx}): {e}", "error")
-                        overlay_results[idx] = None
-
-                # 按序编码
-                for i in range(batch_count):
-                    if self._cancelled:
-                        break
-
-                    current_idx = frame_idx + i
-                    overlay_img = overlay_results.get(current_idx)
-
-                    if overlay_img is None:
-                        overlay_img = Image.new("RGBA", (canvas_width, canvas_height), (0, 0, 0, 0))
-
-                    # 转为 PyAV VideoFrame
-                    if pix_fmt == "argb":
-                        # qtrle + argb：直接从 RGBA numpy 数组
-                        arr = np.array(overlay_img)  # (H, W, 4) RGBA
-                        # RGBA → ARGB（swap R 和 A 通道）
-                        argb_arr = np.empty_like(arr)
-                        argb_arr[:, :, 0] = arr[:, :, 3]  # A
-                        argb_arr[:, :, 1] = arr[:, :, 2]  # R (B in BGRA)
-                        argb_arr[:, :, 2] = arr[:, :, 1]  # G
-                        argb_arr[:, :, 3] = arr[:, :, 0]  # B (R in BGRA)
-                        # 实际上 PyAV from_ndarray 对于 argb 格式期望的是 ARGB 顺序
-                        # 但 PIL 是 RGBA，需要转换
-                        # 更可靠的方式：用 reformat
-                        out_frame = av.VideoFrame.from_ndarray(arr, format="rgba")
-                        out_frame = out_frame.reformat(format="argb")
-                    else:
-                        # yuva420p：从 RGBA 转
-                        arr = np.array(overlay_img)  # (H, W, 4) RGBA
-                        out_frame = av.VideoFrame.from_ndarray(arr, format="rgba")
-                        out_frame = out_frame.reformat(format="yuva420p")
-
-                    for packet in v_out.encode(out_frame):
+            # 编码音频
+            if in_a and a_out:
+                try:
+                    for a_frame in inp_audio_src.decode(in_a):
+                        a_frame.pts = None
+                        for packet in a_out.encode(a_frame):
+                            out.mux(packet)
+                    for packet in a_out.encode():
                         out.mux(packet)
+                except Exception as audio_err:
+                    self.add_log(f"⚠️ 音频编码失败: {audio_err}", "warning")
 
-                    encoded_count += 1
+            # 显式关闭，确保文件句柄释放
+            out.close()
+            out = None
+            inp_video.close()
+            inp_video = None
+            inp_audio_src.close()
+            inp_audio_src = None
 
-                    # 更新进度
-                    if encoded_count % 10 == 0 or encoded_count == total_frames:
-                        elapsed = time.time() - start_time
-                        current_fps = encoded_count / elapsed if elapsed > 0 else 0
-                        self.stats["frames_rendered"] = encoded_count
-                        self.stats["frames_encoded"] = encoded_count
-                        self.stats["overlay_fps"] = round(current_fps, 1)
-                        self.stats["encode_fps"] = round(current_fps, 1)
-                        self.stats["elapsed_sec"] = round(elapsed, 1)
-                        if current_fps > 0:
-                            remaining = (total_frames - encoded_count) / current_fps
-                            self.stats["eta_sec"] = round(remaining, 0)
-                        self.stats["progress_pct"] = round(
-                            min(encoded_count, total_frames) / total_frames * 100, 1
-                        )
+            # 强制 GC 释放可能残留的文件句柄引用
+            gc.collect()
 
-                        self.add_log(
-                            f"📊 进度: {encoded_count}/{total_frames} 帧, "
-                            f"{current_fps:.1f} fps, ETA {self.stats['eta_sec']:.0f}s",
-                            "progress"
-                        )
+            os.remove(temp_path)
+            self.add_log(f"🔊 音频混流完成")
+            return video_path
 
-                        if progress_callback and encoded_count % 20 == 0:
-                            progress_callback(dict(self.stats))
+        except Exception as e:
+            self.add_log(f"⚠️ 音频混流失败: {e}，输出无音频", "warning")
+            # 确保关闭所有打开的容器
+            for container in (out, inp_video, inp_audio_src):
+                if container is not None:
+                    try:
+                        container.close()
+                    except:
+                        pass
+            gc.collect()
+            # 恢复无音频版本
+            if os.path.exists(temp_path) and not os.path.exists(video_path):
+                try:
+                    os.rename(temp_path, video_path)
+                except OSError:
+                    pass
+            elif os.path.exists(temp_path):
+                # video_path 已存在（部分写入），删除临时文件
+                try:
+                    os.remove(temp_path)
+                except OSError:
+                    pass
+            return video_path
 
-                frame_idx = batch_end
+    # ══════════════════════════════════════════════════════════
+    #  主线程 Tick 模式（用于调试）
+    # ══════════════════════════════════════════════════════════
 
-        # flush 编码器
-        for packet in v_out.encode():
-            out.mux(packet)
+    def render_video_tick_mode(
+        self,
+        video_path: str,
+        fit_data: FitData,
+        widgets: list,
+        time_sync: TimeSyncConfig,
+        output_path: str,
+        canvas_width: int = 1920,
+        canvas_height: int = 1080,
+        fps: Optional[float] = None,
+        start_sec: float = 0,
+        end_sec: Optional[float] = None,
+        codec: str = "libx264",
+        preset: str = "fast",
+        crf: int = 23,
+        audio_mode: str = "copy",
+        overlay_only: bool = False,
+        overlay_codec: str = "qtrle",
+        max_ticks: Optional[int] = None,
+    ) -> dict:
+        """主线程 Tick 模式渲染：逐步调用每个 service 的 tick()
 
-        out.close()
-        self.add_log(f"💾 输出文件: {output_path}")
-        return output_path
+        用于调试各环节问题。三个 service 在主线程中按序 Tick，
+        不启动子进程，可直接断点调试。
 
-    # ── Overlay 帧渲染 ─────────────────────────────────────
+        Args:
+            max_ticks: 最多执行的 tick 轮数。None 则执行到完成。
+        """
+        import queue
+        from services.render_services import (
+            SharedFrameBuffer, SlotState,
+            DecodeService, OverlayService, EncodeService,
+        )
+
+        self._cancelled = False
+        self.logs = []
+        start_time = time.time()
+
+        # 获取视频信息
+        from services.fit_parser import FitParserService
+        from services.video_analyzer import VideoAnalyzerService
+
+        video_info = VideoAnalyzerService.analyze(video_path) if not overlay_only else None
+        if not overlay_only and not video_info:
+            return {"status": "error", "error": f"视频分析失败: {video_path}", "stats": self.stats}
+
+        if fps is None or fps <= 0:
+            fps = video_info.fps or 29.97 if video_info else 29.97
+        if end_sec is None or end_sec <= 0:
+            end_sec = video_info.duration if video_info else 0
+
+        total_duration = end_sec - start_sec
+        total_frames = int(total_duration * fps)
+
+        if total_frames <= 0:
+            return {"status": "error", "error": f"渲染范围无效", "stats": self.stats}
+
+        self.stats["total_frames"] = total_frames
+        self.stats["phase"] = "rendering"
+
+        # 预计算
+        record_lookup = [None] * total_frames
+        fit_time_lookup = [None] * total_frames
+        for i in range(total_frames):
+            video_elapsed = i / fps + start_sec
+            fit_time = time_sync.fit_time_at_video_seconds(video_elapsed)
+            fit_time_lookup[i] = fit_time
+            if fit_time is not None:
+                record_lookup[i] = FitParserService.get_record_at(fit_data, fit_time)
+
+        # 序列化
+        fit_data_dict = fit_data.to_dict(include_records=True)
+        widgets_dicts = [w.to_dict() for w in widgets]
+        record_lookup_dicts = [r.to_dict() if r is not None else None for r in record_lookup]
+        fit_time_lookup_serialized = []
+        for ft in fit_time_lookup:
+            if ft is not None:
+                fit_time_lookup_serialized.append(ft.isoformat() if hasattr(ft, 'isoformat') else str(ft))
+            else:
+                fit_time_lookup_serialized.append(None)
+
+        out_channels = 4 if overlay_only else 3
+
+        # 创建本地 queue（非 mp.Queue）
+        frame_meta_queue = queue.Queue(maxsize=8)
+        encode_meta_queue = queue.Queue(maxsize=8)
+
+        def log_fn(level, msg):
+            self.add_log(msg, level)
+
+        def cancel_check():
+            return self._cancelled
+
+        # 创建共享内存缓冲区
+        bg_buf = None
+        if not overlay_only:
+            bg_buf = SharedFrameBuffer(None, canvas_width, canvas_height,
+                                        channels=4, n_slots=4)
+        out_buf = SharedFrameBuffer(None, canvas_width, canvas_height,
+                                     channels=out_channels, n_slots=4)
+
+        # 创建 Service 实例
+        decode_svc = None
+        if not overlay_only:
+            decode_svc = DecodeService(
+                video_path=video_path,
+                start_sec=start_sec,
+                end_sec=end_sec,
+                fps=fps,
+                canvas_width=canvas_width,
+                canvas_height=canvas_height,
+                bg_buf=bg_buf,
+                frame_meta_queue=frame_meta_queue,
+                log_fn=log_fn,
+                cancel_check=cancel_check,
+                rotation=video_info.rotation if video_info else 0,
+            )
+            decode_svc.init()
+        else:
+            # overlay-only feeder
+            for i in range(total_frames):
+                frame_meta_queue.put((0, i))
+            frame_meta_queue.put(None)
+
+        overlay_svc = OverlayService(
+            fit_data_dict=fit_data_dict,
+            fit_time_lookup=fit_time_lookup_serialized,
+            record_lookup_dicts=record_lookup_dicts,
+            widgets_dicts=widgets_dicts,
+            canvas_width=canvas_width,
+            canvas_height=canvas_height,
+            overlay_only=overlay_only,
+            bg_buf=bg_buf,
+            out_buf=out_buf,
+            frame_meta_queue=frame_meta_queue,
+            encode_meta_queue=encode_meta_queue,
+            log_fn=log_fn,
+            cancel_check=cancel_check,
+        )
+        overlay_svc.init()
+
+        encode_svc = EncodeService(
+            output_path=output_path,
+            canvas_width=canvas_width,
+            canvas_height=canvas_height,
+            fps=fps,
+            out_channels=out_channels,
+            overlay_only=overlay_only,
+            overlay_codec=overlay_codec,
+            out_buf=out_buf,
+            encode_meta_queue=encode_meta_queue,
+            log_fn=log_fn,
+            cancel_check=cancel_check,
+            total_frames=total_frames,
+            codec=codec,
+            preset=preset,
+            crf=crf,
+        )
+        encode_svc.init()
+
+        self.add_log("🔧 Tick 模式: 三个 Service 在主线程中按序执行")
+
+        # 主循环
+        tick_count = 0
+        try:
+            while True:
+                if self._cancelled:
+                    break
+                if max_ticks is not None and tick_count >= max_ticks:
+                    self.add_log(f"⏹ 达到最大 tick 数 ({max_ticks})，停止", "warning")
+                    break
+
+                # Decode tick
+                decode_alive = False
+                if decode_svc is not None:
+                    decode_alive = decode_svc.tick()
+                    if not decode_alive:
+                        decode_svc.finish()
+                        decode_svc = None
+
+                # Overlay tick
+                overlay_alive = overlay_svc.tick()
+                if not overlay_alive:
+                    overlay_svc.finish()
+
+                # Encode tick
+                encode_alive = encode_svc.tick()
+                if not encode_alive:
+                    encode_svc.finish()
+
+                tick_count += 1
+
+                # 更新进度
+                encoded = encode_svc._encode_count
+                self.stats["frames_rendered"] = encoded
+                self.stats["frames_encoded"] = encoded
+                elapsed = time.time() - start_time
+                self.stats["elapsed_sec"] = round(elapsed, 1)
+                if encoded > 0 and elapsed > 0:
+                    self.stats["overlay_fps"] = round(encoded / elapsed, 1)
+                    self.stats["encode_fps"] = round(encoded / elapsed, 1)
+                    self.stats["progress_pct"] = round(encoded / total_frames * 100, 1)
+
+                # 所有 service 都完成
+                if decode_svc is None and not overlay_alive and not encode_alive:
+                    break
+
+        except KeyboardInterrupt:
+            self._cancelled = True
+        finally:
+            # flush 编码器（仅当 finish 尚未被调用时）
+            if not encode_svc._done:
+                encode_svc.finish()
+            # cleanup
+            if decode_svc is not None:
+                decode_svc.cleanup()
+            overlay_svc.cleanup()
+            encode_svc.cleanup()
+
+            # 清理共享内存
+            if bg_buf is not None:
+                bg_buf.close()
+                bg_buf.unlink()
+            out_buf.close()
+            out_buf.unlink()
+
+        actual_output = encode_svc.actual_output_path
+
+        # 音频混流
+        if not self._cancelled and not overlay_only and audio_mode == "copy":
+            from services.video_analyzer import VideoAnalyzerService
+            vi = VideoAnalyzerService.analyze(video_path)
+            if vi:
+                actual_output = self._mux_audio(actual_output, video_path, start_sec, end_sec)
+
+        total_time = time.time() - start_time
+        self.stats["phase"] = "done" if not self._cancelled else "cancelled"
+        self.add_log(f"✅ Tick 模式完成: {tick_count} ticks, {total_time:.1f}s")
+
+        return {
+            "status": "completed" if not self._cancelled else "cancelled",
+            "error": None,
+            "stats": self.stats,
+            "output_path": actual_output,
+        }
+
+    # ── 工具方法 ─────────────────────────────────────────────
+
+    @staticmethod
+    def _resolve_encode_params(output_path, overlay_only, overlay_codec,
+                                codec, preset, crf):
+        """根据模式解析编码参数，返回 (output_path, codec, pix_fmt, codec_opts)
+
+        可能根据 overlay_codec 自动调整 output_path 扩展名。
+        """
+        if overlay_only:
+            if overlay_codec == "libvpx-vp9":
+                out_codec = "libvpx-vp9"
+                pix_fmt = "yuva420p"
+                if not output_path.lower().endswith(".webm"):
+                    base, _ = os.path.splitext(output_path)
+                    output_path = base + ".webm"
+                codec_opts = {"crf": str(crf), "b:v": "0"}
+            else:
+                out_codec = "qtrle"
+                pix_fmt = "argb"
+                if not output_path.lower().endswith(".mov"):
+                    base, _ = os.path.splitext(output_path)
+                    output_path = base + ".mov"
+                codec_opts = {}
+        else:
+            out_codec = codec
+            pix_fmt = "yuv420p"
+            codec_opts = {"preset": preset, "crf": str(crf)}
+
+        return output_path, out_codec, pix_fmt, codec_opts
+
+    @staticmethod
+    def _encode_overlay_frame(v_out, out_container, overlay_img, pix_fmt):
+        """编码单帧 overlay 图像（RGBA → 目标 pix_fmt）"""
+        arr = np.array(overlay_img, dtype=np.uint8)
+        out_frame = av.VideoFrame.from_ndarray(arr, format="rgba")
+        if pix_fmt != "rgba":
+            out_frame = out_frame.reformat(format=pix_fmt)
+        for packet in v_out.encode(out_frame):
+            out_container.mux(packet)
 
     @staticmethod
     def _render_overlay_frame(fit_data, fit_time, record, widgets, canvas_width, canvas_height):
@@ -517,47 +802,31 @@ class RenderPipeline:
         from services.frame_renderer import FrameRenderer
 
         canvas = Image.new("RGBA", (canvas_width, canvas_height), (0, 0, 0, 0))
-
         for widget in widgets:
             if not widget.visible:
                 continue
             FrameRenderer._render_widget(canvas, widget, record, fit_data, fit_time)
-
         return canvas
 
-
-# ══════════════════════════════════════════════════════════
-#  向后兼容：保留 _render_overlay_in_subprocess 函数签名
-# ══════════════════════════════════════════════════════════
-
-def _render_overlay_in_subprocess(
-    fit_data_dict: dict,
-    fit_time_iso: str,
-    widgets_list: list,
-    canvas_width: int,
-    canvas_height: int,
-) -> bytes:
-    """在子进程中渲染单帧 overlay，返回 RGBA PNG bytes。
-
-    保留此函数以兼容现有测试。新管线不再使用多进程模式。
-    """
-    from models.fit_data import FitData as _FitData
-    from models.overlay_template import WidgetConfig as _WidgetConfig
-    from datetime import datetime
-    from services.frame_renderer import FrameRenderer
-
-    fit_data = _FitData.from_dict(fit_data_dict)
-    fit_time = datetime.fromisoformat(fit_time_iso) if fit_time_iso else None
-    widgets = [_WidgetConfig.from_dict(w) for w in widgets_list]
-
-    overlay = FrameRenderer.render_frame(
-        fit_data=fit_data,
-        fit_time=fit_time,
-        widgets=widgets,
-        canvas_width=canvas_width,
-        canvas_height=canvas_height,
-    )
-
-    buf = io.BytesIO()
-    overlay.save(buf, format="PNG")
-    return buf.getvalue()
+    def _update_progress(self, encoded_count, total_frames, start_time, progress_callback):
+        """更新进度统计"""
+        elapsed = time.time() - start_time
+        current_fps = encoded_count / elapsed if elapsed > 0 else 0
+        self.stats["frames_rendered"] = encoded_count
+        self.stats["frames_encoded"] = encoded_count
+        self.stats["overlay_fps"] = round(current_fps, 1)
+        self.stats["encode_fps"] = round(current_fps, 1)
+        self.stats["elapsed_sec"] = round(elapsed, 1)
+        if current_fps > 0:
+            remaining = (total_frames - encoded_count) / current_fps
+            self.stats["eta_sec"] = round(remaining, 0)
+        self.stats["progress_pct"] = round(
+            min(encoded_count, total_frames) / total_frames * 100, 1
+        )
+        self.add_log(
+            f"📊 进度: {encoded_count}/{total_frames} 帧, "
+            f"{current_fps:.1f} fps, ETA {self.stats['eta_sec']:.0f}s",
+            "progress"
+        )
+        if progress_callback:
+            progress_callback(dict(self.stats))

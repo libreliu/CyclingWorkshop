@@ -306,13 +306,13 @@
         <div id="syncManual" class="sync-config" style="display:none;">
           <div class="sync-field">
             <label>🎬 视频录制起始时间:</label>
-            <input type="datetime-local" id="syncVideoStartTime" step="1" oninput="App._updateManualComputed()">
+            <input type="datetime-local" id="syncVideoStartTime" step="0.001" oninput="App._updateManualComputed()">
             <span class="text-muted" id="syncVideoStartHint"></span>
           </div>
           <div class="sync-field">
             <label>⏱️ 微调偏移（秒）:</label>
-            <input type="number" id="syncManualOffset" value="0" step="0.5" style="width:80px;" oninput="App._updateManualComputed()">
-            <span class="text-muted">正值=FIT 时间延后</span>
+            <input type="number" id="syncManualOffset" value="0" step="0.001" style="width:100px;" oninput="App._updateManualComputed()">
+            <span class="text-muted">正值=FIT 时间延后（支持毫秒）</span>
           </div>
           <label>时间缩放: <input type="number" id="syncTimeScale" value="1" step="0.1" min="0.1">x</label>
           <div class="sync-computed" id="syncManualComputed"></div>
@@ -337,8 +337,13 @@
                 <img id="videoFramePreview" alt="视频帧预览">
               </div>
               <div class="time-slider">
-                <input type="range" id="videoTimeSlider" min="0" max="100" value="0" step="0.1" oninput="App.onVideoTimeChange(this.value)">
-                <span id="videoTimeLabel">00:00</span>
+                <input type="range" id="videoTimeSlider" min="0" max="100" value="0" step="0.001" oninput="App.onVideoTimeChange(this.value)">
+                <span id="videoTimeLabel">00:00.000</span>
+              </div>
+              <div class="frame-stepper">
+                <button onclick="App.stepVideoFrame(-1)" title="上一帧">⏪</button>
+                <button onclick="App.stepVideoFrame(1)" title="下一帧">⏩</button>
+                <span class="text-muted" id="videoFrameInfo"></span>
               </div>
             </div>
             <div class="preview-track">
@@ -364,11 +369,12 @@
             <div id="widgetOverlay"></div>
           </div>
           <div class="canvas-controls">
-            <button onclick="App.previewPrevFrame()">◀</button>
+            <button onclick="App.stepOverlayFrame(-1)" title="上一帧">⏪</button>
             <button onclick="App.previewPlay()">▶</button>
             <button onclick="App.previewPause()">⏸</button>
-            <input type="range" id="overlayTimeSlider" min="0" max="100" value="0" step="0.1" oninput="App.onOverlayTimeChange(this.value)">
-            <span id="overlayTimeLabel">00:00</span>
+            <button onclick="App.stepOverlayFrame(1)" title="下一帧">⏩</button>
+            <input type="range" id="overlayTimeSlider" min="0" max="100" value="0" step="0.001" oninput="App.onOverlayTimeChange(this.value)">
+            <span id="overlayTimeLabel">00:00.000</span>
           </div>
         </div>
         <div class="design-panel">

@@ -242,7 +242,7 @@ def proxy_tile(style, z, x, y):
     # 2. 下载
     try:
         url = resolve_tile_url(style, z, x, y)
-        img = download_tile(url, timeout=15)
+        img = download_tile(url, timeout=2)
 
         # 保存到字节流
         buf = io.BytesIO()

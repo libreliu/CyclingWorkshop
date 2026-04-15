@@ -2,6 +2,7 @@
 from typing import Optional
 from PIL import Image, ImageDraw, ImageFont
 import math
+import numpy as np
 
 from models.fit_data import FitData, FitRecord
 from models.overlay_template import WidgetConfig
@@ -364,8 +365,10 @@ class FrameRenderer:
     def _render_map_track(draw, widget, record, fit_data, fit_time):
         """渲染轨迹地图（矢量轨迹线 + 位置标记，叠加在底图上）
 
-        优化：使用 bisect 二分查找 walked_points 截断索引，
-        避免遍历 47k 条记录（从 46ms → <1ms）。
+        优化：
+        - 使用 numpy 向量化批量投影所有轨迹点（替代逐点调用闭包）
+        - 使用 bisect 二分查找 walked_points 截断索引
+        - 渐变色轨迹：numpy 插值生成逐段颜色，PIL 逐段绘制
         """
         from services.fit_parser import FitParserService
 
@@ -377,11 +380,14 @@ class FrameRenderer:
         track_color = FrameRenderer._parse_color(style.get("track_color", "#00d4aa"), default=(0, 212, 170, 255))
         marker_color = FrameRenderer._parse_color(style.get("marker_color", "#ff4444"), default=(255, 68, 68, 255))
 
-        # 计算 bounding box
-        lats = [c[0] for c in coords]
-        lons = [c[1] for c in coords]
-        min_lat, max_lat = min(lats), max(lats)
-        min_lon, max_lon = min(lons), max(lons)
+        # ── 提取 numpy 数组 ──
+        coords_arr = np.array(coords, dtype=np.float64)  # shape (N, 2)
+        lats = coords_arr[:, 0]
+        lons = coords_arr[:, 1]
+
+        # ── 计算 bounding box ──
+        min_lat, max_lat = float(lats.min()), float(lats.max())
+        min_lon, max_lon = float(lons.min()), float(lons.max())
         center_lat = (min_lat + max_lat) / 2
         center_lon = (min_lon + max_lon) / 2
 
@@ -390,14 +396,14 @@ class FrameRenderer:
 
         # 添加 padding
         padding = 0.05
-        lat_range *= (1 + padding * 2)
-        lon_range *= (1 + padding * 2)
-        min_lat -= lat_range * padding
-        min_lon -= lon_range * padding
+        lat_range_padded = lat_range * (1 + padding * 2)
+        lon_range_padded = lon_range * (1 + padding * 2)
+        min_lat_padded = min_lat - lat_range * padding
+        min_lon_padded = min_lon - lon_range * padding
 
-        # ── 选择投影方式 ──
+        # ── 选择投影方式并批量计算像素坐标 ──
         tile_style = style.get("tile_source", "")
-        map_mode = style.get("map_mode", "overview")  # "overview" | "follow"
+        map_mode = style.get("map_mode", "overview")
 
         if tile_style:
             # 瓦片底图模式：使用 Web Mercator 坐标系投影
@@ -405,7 +411,6 @@ class FrameRenderer:
                 from services.tile_service import latlon_to_pixel, compute_zoom_for_size
 
                 if map_mode == "follow" and record and record.latitude and record.longitude:
-                    # ── 跟随模式：中心 = 当前位置，高 zoom ──
                     proj_center_lat = record.latitude
                     proj_center_lon = record.longitude
                     zoom = style.get("follow_zoom", 15)
@@ -413,7 +418,6 @@ class FrameRenderer:
                         zoom = int(zoom)
                     zoom = max(10, min(18, zoom))
                 else:
-                    # ── 全览模式 ──
                     proj_center_lat = center_lat
                     proj_center_lon = center_lon
                     zoom = style.get("zoom", None)
@@ -421,15 +425,23 @@ class FrameRenderer:
                         zoom = compute_zoom_for_size(min_lat, max_lat, min_lon, max_lon,
                                                       widget.width, widget.height, padding=0.1)
 
+                # ── numpy 向量化 Web Mercator 投影 ──
                 center_px_x, center_px_y = latlon_to_pixel(proj_center_lat, proj_center_lon, zoom)
                 half_w = widget.width / 2
                 half_h = widget.height / 2
 
-                def project(lat, lon):
-                    px_x, px_y = latlon_to_pixel(lat, lon, zoom)
-                    x = int(px_x - center_px_x + half_w)
-                    y = int(px_y - center_px_y + half_h)
-                    return x, y
+                n = 2.0 ** zoom
+                px_x = (lons + 180.0) / 360.0 * n * 256
+                lat_rad = np.radians(lats)
+                px_y = (1.0 - np.log(np.tan(lat_rad) + 1.0 / np.cos(lat_rad)) / np.pi) / 2.0 * n * 256
+                all_x = (px_x - center_px_x + half_w).astype(np.int32)
+                all_y = (px_y - center_px_y + half_h).astype(np.int32)
+
+                # 投影单个坐标（用于当前位置标记等少量点）
+                def project_single(lat, lon):
+                    sx, sy = latlon_to_pixel(lat, lon, zoom)
+                    return int(sx - center_px_x + half_w), int(sy - center_px_y + half_h)
+
             except Exception:
                 tile_style = ""  # 回退到矢量模式
 
@@ -438,85 +450,106 @@ class FrameRenderer:
             margin = 5
             w = widget.width - margin * 2
             h = widget.height - margin * 2
-
-            # 修正宽高比：使用等距投影（经度修正）
             cos_lat = math.cos(math.radians(center_lat))
-            effective_lon_range = lon_range * cos_lat
+            effective_lon_range = lon_range_padded * cos_lat
 
-            # 保持地理宽高比的映射
-            def project(lat, lon):
-                x = margin + int(((lon - min_lon) * cos_lat) / effective_lon_range * w)
-                y = margin + int((max_lat - lat) / lat_range * h)
+            # ── numpy 向量化等距投影 ──
+            all_x = (margin + ((lons - min_lon_padded) * cos_lat) / effective_lon_range * w).astype(np.int32)
+            all_y = (margin + (max_lat + lat_range * padding - lats) / lat_range_padded * h).astype(np.int32)
+
+            def project_single(lat, lon):
+                x = margin + int(((lon - min_lon_padded) * cos_lat) / effective_lon_range * w)
+                y = margin + int((max_lat + lat_range * padding - lat) / lat_range_padded * h)
                 return x, y
 
-        # 绘制全部轨迹线（暗色）
-        points = [project(lat, lon) for lat, lon in coords]
-        if len(points) > 1:
-            dim_track = (track_color[0]//3, track_color[1]//3, track_color[2]//3, 200)
-            draw.line(points, fill=dim_track, width=2)
+        # ── 批量生成 points 列表 ──
+        all_points = list(zip(all_x.tolist(), all_y.tolist()))
 
-        # 绘制已走路径（亮色）：用 bisect 二分查找截断索引
+        # ── 绘制全部轨迹线（暗色） ──
+        if len(all_points) > 1:
+            dim_track = (track_color[0] // 3, track_color[1] // 3, track_color[2] // 3, 200)
+            draw.line(all_points, fill=dim_track, width=2)
+
+        # ── 绘制已走路径（亮色+渐变）：numpy bisect + 切片 ──
         if fit_time and record and record.latitude and record.longitude:
             session = fit_data.primary_session
             if session and session.records:
-                walked_points = FrameRenderer._get_walked_points_bisect(
-                    session.records, fit_time, project)
-                if len(walked_points) > 1:
-                    draw.line(walked_points, fill=track_color, width=3)
+                walked_points, walked_colors = FrameRenderer._get_walked_points_vectorized(
+                    session.records, fit_time, all_x, all_y)
 
-        # 当前位置标记
+                # 渐变绘制：用 PIL 逐段绘制不同颜色
+                if walked_points and len(walked_points) > 1:
+                    n_walked = len(walked_points)
+                    # 渐变 alpha：从暗(100)到亮(255)
+                    alphas = np.linspace(100, 255, n_walked, dtype=np.int32)
+                    base_r, base_g, base_b = track_color[0], track_color[1], track_color[2]
+
+                    # 逐段绘制（分段批量，避免逐像素调用）
+                    # 每 k 帧一段，平衡视觉效果和 draw 调用次数
+                    segment_size = max(1, n_walked // 32)
+                    for seg_start in range(0, n_walked - 1, segment_size):
+                        seg_end = min(seg_start + segment_size + 1, n_walked)
+                        seg_points = walked_points[seg_start:seg_end]
+                        # 取段中间 alpha
+                        mid_alpha = int(alphas[min(seg_start + segment_size // 2, n_walked - 1)])
+                        seg_color = (base_r, base_g, base_b, mid_alpha)
+                        if len(seg_points) > 1:
+                            draw.line(seg_points, fill=seg_color, width=3)
+
+        # ── 当前位置标记 ──
         if record and record.latitude and record.longitude:
-            cx, cy = project(record.latitude, record.longitude)
+            cx, cy = project_single(record.latitude, record.longitude)
             marker_size = style.get("marker_size", 6)
             draw.ellipse([cx - marker_size, cy - marker_size, cx + marker_size, cy + marker_size],
                          fill=marker_color)
 
     @staticmethod
-    def _get_walked_points_bisect(records, fit_time, project_fn):
-        """使用 bisect 二分查找已走路径点（替代全遍历）
-
-        records 按 timestamp 升序排列，用 bisect 找到 fit_time 的位置，
-        只遍历 fit_time 之前有坐标的记录。
+    def _get_walked_points_vectorized(records, fit_time, all_x, all_y):
+        """使用 bisect + numpy 切片获取已走路径点（替代逐点调用闭包）
 
         Args:
             records: FitRecord 列表（按 timestamp 升序）
             fit_time: 当前 FIT 时间
-            project_fn: 投影函数 (lat, lon) → (x, y)
+            all_x: np.ndarray, 全部轨迹点的 x 像素坐标
+            all_y: np.ndarray, 全部轨迹点的 y 像素坐标
 
         Returns:
             walked_points: [(x, y), ...] 已走路径的投影点列表
+            walked_alphas: np.ndarray 对应的 alpha 值（可选渐变）
         """
         import bisect
 
-        # 构建排序的 timestamp 列表用于 bisect
-        # 只在 records 有足够多时才做优化（小数据集全遍历也很快）
         n = len(records)
         if n < 1000:
-            # 小数据集：直接遍历
+            # 小数据集：直接切片
+            cut_idx = n
+            for i, r in enumerate(records):
+                if r.timestamp and r.timestamp > fit_time:
+                    cut_idx = i
+                    break
+            # 从 all_x/all_y 中取有坐标的记录
             walked_points = []
-            for r in records:
-                if r.timestamp and r.timestamp <= fit_time and r.latitude and r.longitude:
-                    walked_points.append(project_fn(r.latitude, r.longitude))
-            return walked_points
+            for i in range(cut_idx):
+                r = records[i]
+                if r.latitude is not None and r.longitude is not None and i < len(all_x):
+                    walked_points.append((int(all_x[i]), int(all_y[i])))
+            return walked_points, None
 
         # 大数据集：bisect 查找
-        # 找到第一个 timestamp > fit_time 的记录索引
-        # 使用虚拟 key：提取 timestamp 用于比较
         timestamps = [r.timestamp for r in records if r.timestamp is not None]
         if not timestamps:
-            return []
+            return [], None
 
-        # bisect_right: 找到 fit_time 右侧插入点
         cut_idx = bisect.bisect_right(timestamps, fit_time)
 
-        # 只遍历 [0, cut_idx) 范围内有坐标的记录
+        # 构建 mask：有坐标且在 cut_idx 范围内
         walked_points = []
-        for i in range(cut_idx):
+        for i in range(min(cut_idx, len(all_x))):
             r = records[i]
             if r.latitude is not None and r.longitude is not None:
-                walked_points.append(project_fn(r.latitude, r.longitude))
+                walked_points.append((int(all_x[i]), int(all_y[i])))
 
-        return walked_points
+        return walked_points, None
 
     @staticmethod
     def _render_label(draw, widget):

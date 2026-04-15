@@ -827,7 +827,7 @@ const App = {
     if (this.state.videoInfo) {
       document.getElementById("syncVideoRange").textContent =
         `视频时长: ${this.formatDuration(this.state.videoInfo.duration)}`;
-      document.getElementById("videoTimeSlider").max = Math.floor(this.state.videoInfo.duration);
+      document.getElementById("videoTimeSlider").max = this.state.videoInfo.duration;
       // 同步 Step 3 的 timeScale 初始值
       const step1Scale = this.getTimeScale();
       const syncTimeScale = document.getElementById("syncTimeScale");
@@ -866,9 +866,10 @@ const App = {
     if (input.value) return;
     const inferred = this._inferVideoStartTime();
     if (inferred) {
-      // datetime-local 需要 YYYY-MM-DDTHH:mm:ss 格式
+      // datetime-local step=0.001 支持 YYYY-MM-DDTHH:mm:ss.SSS 格式
       const pad = n => String(n).padStart(2, "0");
-      input.value = `${inferred.getFullYear()}-${pad(inferred.getMonth() + 1)}-${pad(inferred.getDate())}T${pad(inferred.getHours())}:${pad(inferred.getMinutes())}:${pad(inferred.getSeconds())}`;
+      const pad3 = n => String(n).padStart(3, "0");
+      input.value = `${inferred.getFullYear()}-${pad(inferred.getMonth() + 1)}-${pad(inferred.getDate())}T${pad(inferred.getHours())}:${pad(inferred.getMinutes())}:${pad(inferred.getSeconds())}.${pad3(inferred.getMilliseconds())}`;
       if (hint) {
         const source = (this.state.videoInfo?.file_path || "").split(/[\\/]/).pop()?.match(/^DJI_/)
           ? "从文件名推断" : "从文件修改时间推断";
@@ -981,12 +982,53 @@ const App = {
     el.innerHTML = `<span class='text-muted'>视频 0s → FIT ${sign}${diff.toFixed(1)}s | FIT 起始: ${fitStart.toLocaleString()} | 视频起始: ${videoStartTime.toLocaleString()}</span>`;
   },
 
+  _videoFrameDebounce: null,
+  _syncMarkerDebounce: null,
+
   async onVideoTimeChange(sec) {
-    document.getElementById("videoTimeLabel").textContent = this.formatSeconds(parseFloat(sec));
+    const s = parseFloat(sec);
+    document.getElementById("videoTimeLabel").textContent = this.formatSeconds(s);
+    this._updateVideoFrameInfo(s);
+
+    // 防抖：帧预览 300ms，同步标记 500ms
     if (this.state.videoId) {
-      document.getElementById("videoFramePreview").src = API.getVideoFrame(this.state.videoId, sec);
+      clearTimeout(this._videoFrameDebounce);
+      const id = this.state.videoId;
+      this._videoFrameDebounce = setTimeout(() => {
+        document.getElementById("videoFramePreview").src = API.getVideoFrame(id, s);
+      }, 300);
     }
-    await this.updateSyncMarker(parseFloat(sec));
+
+    clearTimeout(this._syncMarkerDebounce);
+    this._syncMarkerDebounce = setTimeout(() => {
+      this.updateSyncMarker(s);
+    }, 500);
+  },
+
+  /** 单帧步进（slider 是视频绝对时间，步进量 = 1/fps，不受 timeScale 影响） */
+  stepVideoFrame(direction) {
+    const slider = document.getElementById("videoTimeSlider");
+    const fps = this.state.videoInfo?.fps || 29.97;
+    const overrideFps = parseFloat(document.getElementById("videoFpsOverride")?.value);
+    const effectiveFps = overrideFps > 0 ? overrideFps : fps;
+    const frameDuration = 1 / effectiveFps;
+    const cur = parseFloat(slider.value);
+    const next = Math.max(0, Math.min(parseFloat(slider.max), cur + direction * frameDuration));
+    slider.value = next;
+    this.onVideoTimeChange(next);
+  },
+
+  /** 更新帧号信息显示 */
+  _updateVideoFrameInfo(sec) {
+    const el = document.getElementById("videoFrameInfo");
+    if (!el) return;
+    const fps = this.state.videoInfo?.fps || 29.97;
+    const overrideFps = parseFloat(document.getElementById("videoFpsOverride")?.value);
+    const effectiveFps = overrideFps > 0 ? overrideFps : fps;
+    const frameIdx = Math.round(sec * effectiveFps);
+    const timeScale = this.getTimeScale() || 1;
+    const fitElapsed = sec * timeScale;
+    el.textContent = `帧 #${frameIdx} | ${effectiveFps.toFixed(1)}fps | FIT ${this.formatDuration(fitElapsed)}`;
   },
 
   async updateSyncMarker(videoSec) {
@@ -1026,9 +1068,9 @@ const App = {
     const tr = document.createElement("tr");
     const session = this.state.fitData?.sessions?.[0];
     const fitStartVal = session?.start_time
-      ? new Date(session.start_time).toISOString().slice(0, 19)
+      ? new Date(session.start_time).toISOString().slice(0, 23)
       : "";
-    tr.innerHTML = `<td>${idx}</td><td><input type="number" value="0" step="0.1" style="width:80px;"></td><td><input type="datetime-local" value="${fitStartVal}" step="1"></td><td><button onclick="this.closest('tr').remove()" class="btn-danger" style="padding:2px 8px">删</button></td>`;
+    tr.innerHTML = `<td>${idx}</td><td><input type="number" value="0" step="0.001" style="width:100px;"></td><td><input type="datetime-local" value="${fitStartVal}" step="0.001"></td><td><button onclick="this.closest('tr').remove()" class="btn-danger" style="padding:2px 8px">删</button></td>`;
     tbody.appendChild(tr);
   },
 
@@ -1037,7 +1079,8 @@ const App = {
     await this.loadTemplates();
     this.initCanvas();
     if (this.state.videoInfo) {
-      document.getElementById("overlayTimeSlider").max = Math.floor(this.state.videoInfo.duration);
+      document.getElementById("overlayTimeSlider").max = this.state.videoInfo.duration;
+      document.getElementById("overlayTimeSlider").step = 1 / (this.state.videoInfo.fps || 29.97);
     }
   },
 
@@ -1076,7 +1119,7 @@ const App = {
   _previewDebounce: null,
   requestPreview(sec) {
     clearTimeout(this._previewDebounce);
-    this._previewDebounce = setTimeout(() => this._doPreview(sec), 200);
+    this._previewDebounce = setTimeout(() => this._doPreview(sec), 300);
   },
 
   async _doPreview(sec) {
@@ -1553,10 +1596,20 @@ const App = {
     this.requestPreview(parseFloat(sec));
   },
 
-  previewPrevFrame() {
+  stepOverlayFrame(direction) {
     const slider = document.getElementById("overlayTimeSlider");
-    slider.value = Math.max(0, parseFloat(slider.value) - 1);
-    this.onOverlayTimeChange(slider.value);
+    const fps = this.state.videoInfo?.fps || 29.97;
+    const overrideFps = parseFloat(document.getElementById("videoFpsOverride")?.value);
+    const effectiveFps = overrideFps > 0 ? overrideFps : fps;
+    const frameDuration = 1 / effectiveFps;
+    const cur = parseFloat(slider.value);
+    const next = Math.max(0, Math.min(parseFloat(slider.max), cur + direction * frameDuration));
+    slider.value = next;
+    this.onOverlayTimeChange(next);
+  },
+
+  previewPrevFrame() {
+    this.stepOverlayFrame(-1);
   },
 
   previewPlay() {
@@ -2237,9 +2290,11 @@ const App = {
   },
 
   formatSeconds(sec) {
+    if (sec == null || isNaN(sec)) return "--";
     const m = Math.floor(sec / 60);
     const s = Math.floor(sec % 60);
-    return `${String(m).padStart(2,"0")}:${String(s).padStart(2,"0")}`;
+    const ms = Math.round((sec % 1) * 1000);
+    return `${String(m).padStart(2,"0")}:${String(s).padStart(2,"0")}.${String(ms).padStart(3,"0")}`;
   },
 
   formatDateTime(iso) {

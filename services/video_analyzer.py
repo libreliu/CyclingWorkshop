@@ -1,6 +1,6 @@
 """视频分析服务
 
-帧提取：PyAV（Python 侧旋转处理，方向可靠）
+帧提取：PyAV 解码（不自动旋转）+ Pillow 手动 transpose
 视频元数据：subprocess ffprobe
 """
 import io
@@ -9,6 +9,8 @@ import os
 import subprocess
 from datetime import datetime
 from typing import Optional
+
+from PIL import Image
 
 import config
 from models.video_config import VideoInfo
@@ -98,36 +100,42 @@ class VideoAnalyzerService:
             return None
 
     @staticmethod
-    def extract_frame(file_path: str, timestamp_sec: float, timeout: int = 10,
-                      rotation: int = 0) -> Optional[bytes]:
+    def _apply_rotation(img: "Image.Image", rotation: int) -> "Image.Image":
+        """根据 rotation metadata 手动旋转 PIL Image
+
+        PyAV/libavcodec 不会自动旋转帧（auto-rotate 是 fftools 层功能），
+        需要在 Python 侧手动应用。
+
+        Args:
+            img: PIL Image
+            rotation: 旋转角度（0, 90, 180, 270, -90, -180）
+
+        Returns:
+            旋转后的 PIL Image
+        """
+        if rotation == 0:
+            return img
+        elif rotation == 90:
+            return img.transpose(Image.Transpose.ROTATE_270)
+        elif rotation in (-90, 270):
+            return img.transpose(Image.Transpose.ROTATE_90)
+        elif rotation in (180, -180):
+            return img.transpose(Image.Transpose.ROTATE_180)
+        else:
+            return img  # 未知角度不处理
+
+    @staticmethod
+    def extract_frame(file_path: str, timestamp_sec: float,
+                       rotation: int = 0) -> Optional[bytes]:
         """提取视频指定时间点的帧为 JPEG
+
+        PyAV/libavcodec 不会自动旋转帧，需要手动根据 rotation metadata 旋转。
 
         Args:
             file_path: 视频文件路径
             timestamp_sec: 提取时间点（秒）
-            timeout: 超时时间
-            rotation: 视频旋转角度（0/90/180/270/-90/-180/-270），
-                      PyAV 自动应用旋转 metadata，此参数作为备用
+            rotation: 视频旋转角度（来自 ffprobe side_data_list）
         """
-        return VideoAnalyzerService._extract_frame_pyav(
-            file_path, timestamp_sec, rotation
-        )
-
-    @staticmethod
-    def _apply_rotation(img, rotation: int):
-        """对 PIL Image 应用旋转（90° 增量）"""
-        if rotation in (180, -180):
-            return img.transpose(2)  # ROTATE_180
-        elif rotation in (90, -270):
-            return img.transpose(7)  # ROTATE_90  (逆时针90° → 顺时针补正)
-        elif rotation in (270, -90):
-            return img.transpose(6)  # ROTATE_270 (顺时针90° → 逆时针补正)
-        return img
-
-    @staticmethod
-    def _extract_frame_pyav(file_path: str, timestamp_sec: float,
-                            rotation: int = 0) -> Optional[bytes]:
-        """使用 PyAV 提取视频帧（自动应用旋转 metadata）"""
         if not os.path.isfile(file_path):
             return None
 
@@ -137,27 +145,31 @@ class VideoAnalyzerService:
             container = av.open(file_path)
             stream = container.streams.video[0]
 
-            # PyAV (libav) 默认 auto-rotate，会自动应用 rotation metadata
+            # PyAV 不自动旋转，帧方向与编码一致
             stream.thread_type = "AUTO"
 
             # seek 到目标时间
             # stream.time_base 是 fractions.Fraction，如 1/30000
             # seek 需要流时间基下的时间戳
             target_ts = int(timestamp_sec / float(stream.time_base))
-            container.seek(target_ts, stream=stream)
+            # backward=True 确保 seek 到目标之前最近的关键帧
+            container.seek(target_ts, stream=stream, backward=True)
 
-            # 获取下一帧（seek 后可能需要跳过几帧才能对齐）
+            # seek 后从关键帧开始解码，需要持续解码直到 pts >= target_ts
+            # 否则只取第一帧会总是返回关键帧（GOP 间隔通常 1-2 秒）
             frame = None
             for f in container.decode(stream):
-                frame = f
-                break
+                if f.pts >= target_ts:
+                    frame = f
+                    break
 
             if frame is None:
                 container.close()
                 return None
 
-            # 转为 PIL Image（PyAV 已自动旋转）
+            # 转为 PIL Image 并手动旋转
             img = frame.to_image()
+            img = VideoAnalyzerService._apply_rotation(img, rotation)
 
             # 转为 JPEG bytes
             buf = io.BytesIO()
@@ -169,61 +181,4 @@ class VideoAnalyzerService:
 
         except Exception as e:
             print(f"[VideoAnalyzer] PyAV 帧提取失败: {e}")
-            # 回退到 subprocess 方式
-            return VideoAnalyzerService._extract_frame_subprocess(
-                file_path, timestamp_sec, 15, rotation
-            )
-
-    @staticmethod
-    def _build_rotation_filter(rotation: int) -> str:
-        """根据旋转角度构建 ffmpeg transpose 滤镜字符串"""
-        if rotation in (180, -180):
-            return "hflip,vflip"
-        elif rotation in (90, -270):
-            return "transpose=1"
-        elif rotation in (270, -90):
-            return "transpose=2"
-        return ""
-
-    @staticmethod
-    def _extract_frame_subprocess(file_path: str, timestamp_sec: float, timeout: int = 10,
-                                  rotation: int = 0) -> Optional[bytes]:
-        """提取视频帧（python-ffmpeg 构建命令 + subprocess 执行）— 作为 PyAV 的回退"""
-        if not os.path.isfile(file_path):
-            return None
-
-        try:
-            from ffmpeg import FFmpeg as FFmpegBuilder
-
-            # 构建旋转滤镜
-            rotation_filter = VideoAnalyzerService._build_rotation_filter(rotation)
-
-            if rotation_filter:
-                vf = f"{rotation_filter}"
-                builder = (
-                    FFmpegBuilder(executable=config.FFMPEG_PATH)
-                    .input(file_path, ss=str(timestamp_sec))
-                    .output("pipe:1", vframes="1", **{"q:v": "2"},
-                            f="image2pipe", vcodec="mjpeg", vf=vf)
-                )
-            else:
-                builder = (
-                    FFmpegBuilder(executable=config.FFMPEG_PATH)
-                    .input(file_path, ss=str(timestamp_sec))
-                    .output("pipe:1", vframes="1", **{"q:v": "2"},
-                            f="image2pipe", vcodec="mjpeg")
-                )
-            cmd_args = builder.arguments
-
-            result = subprocess.run(cmd_args, capture_output=True, timeout=timeout)
-            if result.returncode != 0 or len(result.stdout) < 100:
-                stderr_text = result.stderr.decode('utf-8', errors='replace')[-200:] if result.stderr else ""
-                print(f"[VideoAnalyzer] 帧提取失败 (rc={result.returncode}): {stderr_text}")
-                return None
-            return result.stdout
-        except subprocess.TimeoutExpired:
-            print(f"[VideoAnalyzer] 帧提取超时 ({timeout}s): {file_path} @ {timestamp_sec}s")
-            return None
-        except Exception as e:
-            print(f"[VideoAnalyzer] 帧提取异常: {e}")
             return None

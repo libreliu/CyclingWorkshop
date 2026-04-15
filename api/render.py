@@ -8,9 +8,8 @@ from datetime import datetime
 
 from flask import Blueprint, request, jsonify, send_file, Response
 
-from models.fit_data import FitData
 from models.overlay_template import WidgetConfig
-from models.video_config import TimeSyncConfig, VideoInfo
+from models.video_config import TimeSyncConfig
 from services.frame_renderer import FrameRenderer
 from services.render_pipeline import RenderPipeline
 from services.video_analyzer import VideoAnalyzerService
@@ -67,19 +66,17 @@ def render_preview():
     # 如果需要视频背景，合成视频帧
     if include_background and video_path and os.path.isfile(video_path):
         try:
-            # 获取视频旋转信息（PyAV 自动处理旋转，rotation 作为备用传入）
-            video_info = None
-            from api.video import _video_cache
-            video_info = _video_cache.get(video_path)
-            rotation = video_info.rotation if video_info else 0
+            # 获取视频 rotation metadata（PyAV 不自动旋转，需手动处理）
+            vi = VideoAnalyzerService.analyze(video_path)
+            rotation = vi.rotation if vi else 0
+
             frame_bytes = VideoAnalyzerService.extract_frame(
-                video_path, video_time_sec, timeout=15, rotation=rotation or 0
+                video_path, video_time_sec, rotation=rotation
             )
             if frame_bytes:
                 from PIL import Image
                 bg_img = Image.open(io.BytesIO(frame_bytes)).convert("RGBA")
-                # PyAV 自动旋转，无需手动 PIL 旋转
-                # 缩放背景到画布尺寸
+                # resize 到画布尺寸
                 if bg_img.size != (canvas_width, canvas_height):
                     bg_img = bg_img.resize((canvas_width, canvas_height), Image.LANCZOS)
                 bg_img.alpha_composite(overlay_img)
@@ -166,6 +163,7 @@ def render_start():
     crf = render_settings.get("crf", 23)
     audio_mode = render_settings.get("audio", "copy")  # "copy" | "none"
     overlay_only = render_settings.get("overlay_only", False)  # 仅输出 overlay 层
+    overlay_codec = render_settings.get("overlay_codec", "qtrle")  # overlay 编码器: qtrle | libvpx-vp9
     num_workers = render_settings.get("num_workers", 4)  # 并行渲染线程数
     batch_size = render_settings.get("batch_size", 8)  # 每批并行帧数
 
@@ -199,7 +197,7 @@ def render_start():
         args=(
             task_id, task, pipeline, fit_data, video_path, widgets, time_sync,
             canvas_width, canvas_height, fps, render_start_sec, render_end_sec,
-            output_path, codec, preset, crf, audio_mode, overlay_only,
+            output_path, codec, preset, crf, audio_mode, overlay_only, overlay_codec,
             num_workers, batch_size,
         ),
         daemon=True,
@@ -212,10 +210,10 @@ def render_start():
 def _render_worker_v3(
     task_id, task, pipeline, fit_data, video_path, widgets, time_sync,
     canvas_width, canvas_height, fps, start_sec, end_sec,
-    output_path, codec, preset, crf, audio_mode, overlay_only,
+    output_path, codec, preset, crf, audio_mode, overlay_only, overlay_codec,
     num_workers, batch_size,
 ):
-    """后台渲染线程 — 使用 PyAV 渲染管线（实时日志）"""
+    """后台渲染线程 — 使用 PyAV 渲染管线（多进程流水线 + 实时日志）"""
 
     def progress_callback(stats):
         """进度回调：更新 task 字典"""
@@ -250,6 +248,7 @@ def _render_worker_v3(
         crf=crf,
         audio_mode=audio_mode,
         overlay_only=overlay_only,
+        overlay_codec=overlay_codec,
         num_workers=num_workers,
         batch_size=batch_size,
         progress_callback=progress_callback,

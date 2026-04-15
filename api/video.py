@@ -59,7 +59,7 @@ def video_frame(video_id):
         return jsonify({"error": "未找到，请先加载"}), 404
 
     t = request.args.get("t", 0, type=float)
-    frame_bytes = VideoAnalyzerService.extract_frame(info.file_path, t, rotation=info.rotation or 0)
+    frame_bytes = VideoAnalyzerService.extract_frame(info.file_path, t, rotation=info.rotation)
     if frame_bytes is None:
         return jsonify({"error": "帧提取失败"}), 500
 
@@ -74,7 +74,7 @@ def video_thumbnail(video_id):
     if not info:
         return jsonify({"error": "未找到，请先加载"}), 404
 
-    frame_bytes = VideoAnalyzerService.extract_frame(info.file_path, 0, rotation=info.rotation or 0)
+    frame_bytes = VideoAnalyzerService.extract_frame(info.file_path, 0, rotation=info.rotation)
     if frame_bytes is None:
         return jsonify({"error": "缩略图提取失败"}), 500
 

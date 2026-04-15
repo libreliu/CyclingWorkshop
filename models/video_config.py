@@ -19,11 +19,16 @@ class VideoInfo:
     rotation: int = 0  # 视频旋转角度（0, 90, 180, 270, -90, -180）
 
     def to_dict(self) -> dict:
+        # 旋转 90°/270° 时，实际显示尺寸与编码尺寸宽高互换
+        display_width, display_height = self.width, self.height
+        if self.rotation in (90, -90, 270, -270):
+            display_width, display_height = self.height, self.width
+
         return {
             "file_path": self.file_path,
             "duration": self.duration,
-            "width": self.width,
-            "height": self.height,
+            "width": display_width,
+            "height": display_height,
             "fps": self.fps,
             "codec": self.codec,
             "bitrate": self.bitrate,
