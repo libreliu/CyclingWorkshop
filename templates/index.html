@@ -408,7 +408,22 @@
         <div class="render-settings">
           <label>输出路径: <input type="text" id="outputPath" placeholder="输出视频路径" style="width:60%;" spellcheck="false"></label>
           <div class="render-row">
-            <label>编码: <select id="renderCodec"><option value="libx264">H.264</option></select></label>
+            <label>编码: <select id="renderCodec">
+              <optgroup label="软件编码">
+                <option value="libx264" selected>H.264 (libx264)</option>
+                <option value="libx265">H.265/HEVC (libx265)</option>
+                <option value="libvpx-vp9">VP9 (libvpx-vp9)</option>
+                <option value="libaom-av1">AV1 (libaom-av1)</option>
+              </optgroup>
+              <optgroup label="硬件编码 (NVIDIA)">
+                <option value="h264_nvenc">H.264 (NVENC)</option>
+                <option value="hevc_nvenc">H.265/HEVC (NVENC)</option>
+              </optgroup>
+              <optgroup label="硬件编码 (AMD/Intel)">
+                <option value="h264_amf">H.264 (AMF)</option>
+                <option value="hevc_amf">H.265/HEVC (AMF)</option>
+              </optgroup>
+            </select></label>
             <label>预设: <select id="renderPreset">
               <option value="ultrafast">ultrafast</option>
               <option value="veryfast">veryfast</option>
@@ -417,6 +432,11 @@
               <option value="slow">slow</option>
             </select></label>
             <label>CRF: <input type="number" id="renderCrf" value="20" min="0" max="51" step="1"></label>
+          </div>
+          <div class="render-row">
+            <label title="使用 GPU 加速视频解码（实验性，可能不稳定）">
+              <input type="checkbox" id="renderHwaccelDecode"> 硬件加速解码
+            </label>
           </div>
           <div class="render-row">
             <label><input type="radio" name="renderAudio" value="copy" checked> 保留原始音频</label>
@@ -461,9 +481,9 @@
             </div>
             <div id="renderCmdBody" class="render-cmd-body" style="display:none;"></div>
           </div>
-          <!-- ffmpeg 实时日志 -->
+          <!-- 渲染实时日志 -->
           <div class="render-log-header" onclick="App._toggleRenderLog()">
-            <span>📋 ffmpeg 日志</span>
+            <span>📋 渲染日志</span>
             <span id="renderLogCount" class="render-log-count">0 条</span>
             <span id="renderLogToggle" class="render-cmd-toggle">▼</span>
           </div>

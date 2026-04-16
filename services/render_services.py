@@ -269,6 +269,7 @@ class DecodeService(StandaloneService):
         log_fn=None,
         cancel_check=None,
         rotation: int = 0,
+        hwaccel_decode: bool = False,
     ):
         super().__init__(log_fn=log_fn, cancel_check=cancel_check)
         self.video_path = video_path
@@ -280,6 +281,7 @@ class DecodeService(StandaloneService):
         self.bg_buf = bg_buf
         self.frame_meta_queue = frame_meta_queue
         self.rotation = rotation
+        self.hwaccel_decode = hwaccel_decode
 
         # 内部状态（init 时初始化）
         self._container = None
@@ -312,6 +314,22 @@ class DecodeService(StandaloneService):
         self._container = av.open(self.video_path)
         self._v_stream = self._container.streams.video[0]
         self._v_stream.thread_type = "AUTO"
+
+        # 尝试硬件加速解码
+        self._hw_device = None
+        if self.hwaccel_decode:
+            try:
+                # 尝试 CUDA (NVIDIA)
+                self._hw_device = av.open("CUDA", mode="r")
+                self._v_stream.codec_context.hw_device = self._hw_device
+                self._log("info", "[Decode] 硬件加速解码已启用 (CUDA)")
+            except Exception:
+                try:
+                    # 尝试 DXVA2 (Windows 通用)
+                    self._v_stream.codec_context.hw_pix_fmt = "d3d11"
+                    self._log("info", "[Decode] 硬件加速解码已启用 (D3D11)")
+                except Exception as e2:
+                    self._log("warning", f"[Decode] 硬件加速解码不可用，回退到 CPU 解码: {e2}")
 
         if self.start_sec > 0:
             target_ts = int(self.start_sec / float(self._v_stream.time_base))
@@ -351,7 +369,7 @@ class DecodeService(StandaloneService):
         if bg_buf is not None:
             # 等待可用槽
             if not bg_buf.wait_slot(self._slot_idx, SlotState.EMPTY, timeout=30):
-                self._log("warning", f"[Decode] 等待槽 {self._slot_idx} 超时")
+                self._log("warning", f"[Decode] 等待槽 {self._slot_idx} 超时（Overlay 进程可能已退出）")
                 self._done = True
                 return False
 
@@ -419,6 +437,12 @@ class DecodeService(StandaloneService):
             except:
                 pass
             self._container = None
+        if self._hw_device is not None:
+            try:
+                self._hw_device.close()
+            except:
+                pass
+            self._hw_device = None
         if self.bg_buf is not None:
             try:
                 self.bg_buf.close()
@@ -463,6 +487,7 @@ class OverlayService(StandaloneService):
         log_fn=None,
         cancel_check=None,
         num_workers: int = 1,
+        overlay_progress=None,
     ):
         super().__init__(log_fn=log_fn, cancel_check=cancel_check)
         self.fit_data_dict = fit_data_dict
@@ -477,6 +502,7 @@ class OverlayService(StandaloneService):
         self.frame_meta_queue = frame_meta_queue
         self.encode_meta_queue = encode_meta_queue
         self.num_workers = num_workers
+        self.overlay_progress = overlay_progress
 
         # 内部状态
         self._fit_data = None
@@ -551,7 +577,7 @@ class OverlayService(StandaloneService):
         bg_buf = self.bg_buf
         if bg_buf is not None:
             if not bg_buf.wait_slot(bg_slot_idx, SlotState.FILLED, timeout=30):
-                self._log("warning", f"[Overlay] 等待 bg 槽 {bg_slot_idx} 超时")
+                self._log("warning", f"[Overlay] 等待 bg 槽 {bg_slot_idx} 超时（Decode 进程可能已退出）")
                 self._done = True
                 return False
 
@@ -585,7 +611,7 @@ class OverlayService(StandaloneService):
         # ── 写入输出缓冲区 ──
         out_buf = self.out_buf
         if not out_buf.wait_slot(self._out_slot_idx, SlotState.EMPTY, timeout=30):
-            self._log("warning", f"[Overlay] 等待 out 槽 {self._out_slot_idx} 超时")
+            self._log("warning", f"[Overlay] 等待 out 槽 {self._out_slot_idx} 超时（Encode 进程可能已退出）")
             self._done = True
             return False
 
@@ -599,6 +625,9 @@ class OverlayService(StandaloneService):
         self.encode_meta_queue.put((self._out_slot_idx, frame_idx))
 
         self._overlay_count += 1
+        # 更新共享进度计数器
+        if self.overlay_progress is not None:
+            self.overlay_progress.value = self._overlay_count
         self._out_slot_idx = (self._out_slot_idx + 1) % out_buf.n_slots
 
         if self._overlay_count % 50 == 0:
@@ -679,6 +708,7 @@ class EncodeService(StandaloneService):
         codec: str = "libx264",
         preset: str = "fast",
         crf: int = 23,
+        encode_progress=None,
     ):
         super().__init__(log_fn=log_fn, cancel_check=cancel_check)
         self.output_path = output_path
@@ -694,6 +724,7 @@ class EncodeService(StandaloneService):
         self.codec = codec
         self.preset = preset
         self.crf = crf
+        self.encode_progress = encode_progress
 
         # 内部状态
         self._container = None
@@ -727,8 +758,32 @@ class EncodeService(StandaloneService):
                 codec_opts = {}
         else:
             self._out_codec = self.codec
-            self._pix_fmt = "yuv420p"
-            codec_opts = {"preset": self.preset, "crf": str(self.crf)}
+            # 根据编码器选择参数
+            if self.codec in ("h264_nvenc", "hevc_nvenc"):
+                self._pix_fmt = "yuv420p"
+                codec_opts = {"preset": self.preset, "cq": str(self.crf)}
+            elif self.codec in ("h264_amf", "hevc_amf"):
+                self._pix_fmt = "yuv420p"
+                codec_opts = {"quality": self.preset, "rc": "cqp",
+                              "qp_i": str(self.crf), "qp_p": str(self.crf),
+                              "qp_b": str(self.crf)}
+            elif self.codec == "libvpx-vp9":
+                self._pix_fmt = "yuv420p"
+                if not output_path.lower().endswith(".webm"):
+                    base, _ = os.path.splitext(output_path)
+                    output_path = base + ".webm"
+                codec_opts = {"crf": str(self.crf), "b:v": "0",
+                              "cpu-used": self.preset}
+            elif self.codec == "libaom-av1":
+                self._pix_fmt = "yuv420p"
+                codec_opts = {"crf": str(self.crf), "cpu-used": self.preset}
+            elif self.codec == "libx265":
+                self._pix_fmt = "yuv420p"
+                codec_opts = {"preset": self.preset, "crf": str(self.crf)}
+            else:
+                # libx264 默认
+                self._pix_fmt = "yuv420p"
+                codec_opts = {"preset": self.preset, "crf": str(self.crf)}
 
         self._actual_output_path = output_path
 
@@ -777,7 +832,7 @@ class EncodeService(StandaloneService):
 
         # 等待帧就绪
         if not self.out_buf.wait_slot(buf_slot_idx, SlotState.FILLED, timeout=30):
-            self._log("warning", f"[Encode] 等待 out 槽 {buf_slot_idx} 超时")
+            self._log("warning", f"[Encode] 等待 out 槽 {buf_slot_idx} 超时（Overlay 进程可能已退出）")
             self._done = True
             return False
 
@@ -808,6 +863,9 @@ class EncodeService(StandaloneService):
         self.out_buf.set_state(buf_slot_idx, SlotState.EMPTY)
 
         self._encode_count += 1
+        # 更新共享进度计数器
+        if self.encode_progress is not None:
+            self.encode_progress.value = self._encode_count
 
         if self._encode_count % 50 == 0:
             elapsed = time.perf_counter() - self._t0
@@ -896,7 +954,7 @@ def decode_service_main(
     canvas_width, canvas_height,
     bg_buf_name, bg_buf_n_slots,
     frame_meta_queue, log_queue, cancel_event,
-    rotation=0,
+    rotation=0, hwaccel_decode=False,
 ):
     """向后兼容：子进程入口函数，内部创建 DecodeService 实例"""
     bg_buf = None
@@ -915,6 +973,7 @@ def decode_service_main(
         log_fn=log_queue,
         cancel_check=cancel_event,
         rotation=rotation,
+        hwaccel_decode=hwaccel_decode,
     )
     # 子进程中 bg_buf 由 service cleanup 关闭
     svc.run_loop()
@@ -933,6 +992,7 @@ def overlay_service_main(
     out_buf_name, out_channels, out_buf_n_slots,
     frame_meta_queue, encode_meta_queue,
     log_queue, cancel_event, num_workers,
+    overlay_progress=None,
 ):
     """向后兼容：子进程入口函数，内部创建 OverlayService 实例"""
     bg_buf = None
@@ -956,6 +1016,7 @@ def overlay_service_main(
         log_fn=log_queue,
         cancel_check=cancel_event,
         num_workers=num_workers,
+        overlay_progress=overlay_progress,
     )
     svc.run_loop()
 
@@ -966,7 +1027,7 @@ def encode_service_main(
     overlay_only, overlay_codec,
     out_buf_name, out_buf_n_slots,
     encode_meta_queue, log_queue, cancel_event,
-    total_frames,
+    total_frames, encode_progress=None,
 ):
     """向后兼容：子进程入口函数，内部创建 EncodeService 实例"""
     out_buf = SharedFrameBuffer(out_buf_name, canvas_width, canvas_height,
@@ -987,5 +1048,6 @@ def encode_service_main(
         codec=codec,
         preset=preset,
         crf=crf,
+        encode_progress=encode_progress,
     )
     svc.run_loop()

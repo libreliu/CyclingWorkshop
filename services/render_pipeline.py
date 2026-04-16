@@ -110,6 +110,7 @@ class RenderPipeline:
         num_workers: int = 4,
         batch_size: int = 8,
         progress_callback=None,
+        hwaccel_decode: bool = False,
     ) -> dict:
         self._cancelled = False
         self.logs = []
@@ -172,6 +173,7 @@ class RenderPipeline:
                 audio_mode, overlay_only, overlay_codec,
                 num_workers, start_time, progress_callback,
                 rotation=video_info.rotation if video_info else 0,
+                hwaccel_decode=hwaccel_decode,
             )
 
             if self._cancelled:
@@ -215,7 +217,7 @@ class RenderPipeline:
         start_sec, end_sec, output_path, codec, preset, crf,
         audio_mode, overlay_only, overlay_codec,
         num_workers, start_time, progress_callback,
-        rotation=0,
+        rotation=0, hwaccel_decode=False,
     ):
         """多进程流水线：Decode → Overlay → Encode
 
@@ -252,6 +254,10 @@ class RenderPipeline:
         log_queue = mp.Queue(maxsize=1000)
         cancel_event = mp.Event()
 
+        # ── 创建共享进度计数器（EncodeService 写，主进程读）──
+        encode_progress = mp.Value('i', 0)  # 已编码帧数
+        overlay_progress = mp.Value('i', 0)  # 已合成帧数
+
         # ── 序列化 fit_data / widgets / record_lookup ──
         fit_data_dict = fit_data.to_dict(include_records=True)
         widgets_dicts = [w.to_dict() for w in widgets]
@@ -287,7 +293,7 @@ class RenderPipeline:
                       canvas_width, canvas_height,
                       bg_buf.name, N_SLOTS,
                       frame_meta_queue, log_queue, cancel_event,
-                      rotation),
+                      rotation, hwaccel_decode),
             )
             decode_proc.start()
         else:
@@ -310,7 +316,8 @@ class RenderPipeline:
                   bg_buf.name if bg_buf else "", N_SLOTS,
                   out_buf.name, out_channels, N_SLOTS,
                   frame_meta_queue, encode_meta_queue,
-                  log_queue, cancel_event, num_workers),
+                  log_queue, cancel_event, num_workers,
+                  overlay_progress),
         )
         overlay_proc.start()
 
@@ -325,7 +332,7 @@ class RenderPipeline:
                   overlay_only, overlay_codec,
                   out_buf.name, N_SLOTS,
                   encode_meta_queue, log_queue, cancel_event,
-                  total_frames),
+                  total_frames, encode_progress),
         )
         encode_proc.start()
 
@@ -338,25 +345,33 @@ class RenderPipeline:
                     cancel_event.set()
                     break
 
+                # 检查子进程状态，记录异常退出
+                for p in procs:
+                    if not p.is_alive() and p.exitcode is not None and p.exitcode != 0:
+                        self.add_log(f"⚠️ {p.name} 异常退出（exitcode={p.exitcode}）", "error")
+
                 # 等待所有子进程结束
                 if all(not p.is_alive() for p in procs):
                     break
 
-                # 更新进度（粗估）
+                # 更新进度（从子进程读取实际帧数）
                 elapsed = time.time() - start_time
-                estimated = min(int(elapsed * fps * 0.8), total_frames)
-                self.stats["frames_rendered"] = estimated
-                self.stats["frames_encoded"] = estimated
+                encoded = encode_progress.value
+                overlaid = overlay_progress.value
+                self.stats["frames_rendered"] = overlaid
+                self.stats["frames_encoded"] = encoded
                 self.stats["elapsed_sec"] = round(elapsed, 1)
-                if estimated > 0 and elapsed > 0:
-                    current_fps = estimated / elapsed
-                    self.stats["overlay_fps"] = round(current_fps, 1)
-                    self.stats["encode_fps"] = round(current_fps, 1)
-                    remaining = (total_frames - estimated) / current_fps
+                # 用编码帧数计算进度（最准确，因为编码是最后一步）
+                progress_frames = encoded if encoded > 0 else overlaid
+                if progress_frames > 0 and elapsed > 0:
+                    current_fps = progress_frames / elapsed
+                    self.stats["overlay_fps"] = round(overlaid / elapsed, 1) if elapsed > 0 else 0
+                    self.stats["encode_fps"] = round(encoded / elapsed, 1) if elapsed > 0 else 0
+                    remaining = (total_frames - progress_frames) / current_fps
                     self.stats["eta_sec"] = round(remaining, 0)
-                    self.stats["progress_pct"] = round(estimated / total_frames * 100, 1)
+                    self.stats["progress_pct"] = round(min(progress_frames, total_frames) / total_frames * 100, 1)
 
-                if progress_callback and int(elapsed) % 2 == 0:
+                if progress_callback:
                     progress_callback(dict(self.stats))
 
                 time.sleep(1.0)
@@ -528,6 +543,7 @@ class RenderPipeline:
         overlay_only: bool = False,
         overlay_codec: str = "qtrle",
         max_ticks: Optional[int] = None,
+        hwaccel_decode: bool = False,
     ) -> dict:
         """主线程 Tick 模式渲染：逐步调用每个 service 的 tick()
 
@@ -625,6 +641,7 @@ class RenderPipeline:
                 log_fn=log_fn,
                 cancel_check=cancel_check,
                 rotation=video_info.rotation if video_info else 0,
+                hwaccel_decode=hwaccel_decode,
             )
             decode_svc.init()
         else:
@@ -762,7 +779,11 @@ class RenderPipeline:
                                 codec, preset, crf):
         """根据模式解析编码参数，返回 (output_path, codec, pix_fmt, codec_opts)
 
-        可能根据 overlay_codec 自动调整 output_path 扩展名。
+        可能根据 overlay_codec / codec 自动调整 output_path 扩展名。
+
+        支持的合成模式编码器：
+          软件：libx264, libx265, libvpx-vp9, libaom-av1
+          硬件：h264_nvenc, hevc_nvenc, h264_amf, hevc_amf
         """
         if overlay_only:
             if overlay_codec == "libvpx-vp9":
@@ -781,8 +802,30 @@ class RenderPipeline:
                 codec_opts = {}
         else:
             out_codec = codec
-            pix_fmt = "yuv420p"
-            codec_opts = {"preset": preset, "crf": str(crf)}
+            # 根据编码器选择参数
+            if codec in ("h264_nvenc", "hevc_nvenc"):
+                pix_fmt = "yuv420p"
+                codec_opts = {"preset": preset, "cq": str(crf)}
+            elif codec in ("h264_amf", "hevc_amf"):
+                pix_fmt = "yuv420p"
+                codec_opts = {"quality": preset, "rc": "cqp", "qp_i": str(crf),
+                              "qp_p": str(crf), "qp_b": str(crf)}
+            elif codec == "libvpx-vp9":
+                pix_fmt = "yuv420p"
+                if not output_path.lower().endswith(".webm"):
+                    base, _ = os.path.splitext(output_path)
+                    output_path = base + ".webm"
+                codec_opts = {"crf": str(crf), "b:v": "0", "cpu-used": preset}
+            elif codec == "libaom-av1":
+                pix_fmt = "yuv420p"
+                codec_opts = {"crf": str(crf), "cpu-used": preset}
+            elif codec == "libx265":
+                pix_fmt = "yuv420p"
+                codec_opts = {"preset": preset, "crf": str(crf)}
+            else:
+                # libx264 默认
+                pix_fmt = "yuv420p"
+                codec_opts = {"preset": preset, "crf": str(crf)}
 
         return output_path, out_codec, pix_fmt, codec_opts
 

@@ -1649,6 +1649,17 @@ const App = {
       document.getElementById("outputPath").value = this.state.videoInfo.file_path.replace(/\.[^.]+$/, "_overlay.mp4");
       document.getElementById("renderEnd").value = this.formatDuration(this.state.videoInfo.duration);
     }
+
+    // 编码器切换时联动预设选项和输出扩展名
+    const codecSelect = document.getElementById("renderCodec");
+    const presetSelect = document.getElementById("renderPreset");
+    if (codecSelect) {
+      codecSelect.addEventListener("change", () => {
+        this._updatePresetOptions(codecSelect.value, presetSelect);
+        this._updateOutputExtension();
+      });
+    }
+
     // overlay-only 复选框联动：显示/隐藏格式选择，切换输出扩展名
     const overlayCb = document.getElementById("renderOverlayOnly");
     const overlayCodec = document.getElementById("renderOverlayCodec");
@@ -1664,9 +1675,7 @@ const App = {
             pathInput.value = path.replace(/\.[^.]+$/, fmt);
           }
         } else {
-          if (!path.toLowerCase().endsWith(".mp4")) {
-            pathInput.value = path.replace(/\.[^.]+$/, ".mp4");
-          }
+          this._updateOutputExtension();
         }
       });
     }
@@ -1679,6 +1688,45 @@ const App = {
           pathInput.value = path.replace(/\.[^.]+$/, fmt);
         }
       });
+    }
+  },
+
+  /** 根据编码器更新预设选项 */
+  _updatePresetOptions(codec, presetSelect) {
+    const presets = {
+      "libx264": [["ultrafast","ultrafast"],["veryfast","veryfast"],["fast","fast"],["medium","medium"],["slow","slow"]],
+      "libx265": [["ultrafast","ultrafast"],["veryfast","veryfast"],["fast","fast"],["medium","medium"],["slow","slow"]],
+      "libvpx-vp9": [["0","最佳 (0)"],["1","较好 (1)"],["2","良好 (2)"],["3","中等 (3)"],["4","较快 (4)"],["5","最快 (5)"]],
+      "libaom-av1": [["0","最佳 (0)"],["2","较好 (2)"],["4","中等 (4)"],["6","较快 (6)"],["8","最快 (8)"]],
+      "h264_nvenc": [["p1","最快 (p1)"],["p2","较快 (p2)"],["p3","中等 (p3)"],["p4","较慢 (p4)"],["p5","良好 (p5)"],["p6","较慢 (p6)"],["p7","最慢 (p7)"]],
+      "hevc_nvenc": [["p1","最快 (p1)"],["p2","较快 (p2)"],["p3","中等 (p3)"],["p4","较慢 (p4)"],["p5","良好 (p5)"],["p6","较慢 (p6)"],["p7","最慢 (p7)"]],
+      "h264_amf": [["speed","速度"],["balanced","平衡"],["quality","质量"]],
+      "hevc_amf": [["speed","速度"],["balanced","平衡"],["quality","质量"]],
+    };
+    const opts = presets[codec] || presets["libx264"];
+    presetSelect.innerHTML = "";
+    opts.forEach(([val, label]) => {
+      const o = document.createElement("option");
+      o.value = val;
+      o.textContent = label;
+      presetSelect.appendChild(o);
+    });
+    // 选中接近中等质量的默认值
+    const midIdx = Math.floor(opts.length / 2);
+    presetSelect.selectedIndex = midIdx;
+  },
+
+  /** 根据编码器和 overlay-only 状态更新输出扩展名 */
+  _updateOutputExtension() {
+    const overlayOnly = document.getElementById("renderOverlayOnly")?.checked || false;
+    if (overlayOnly) return; // overlay-only 由 overlayCodec 决定
+    const codec = document.getElementById("renderCodec")?.value || "libx264";
+    const pathInput = document.getElementById("outputPath");
+    const path = pathInput.value;
+    let ext = ".mp4";
+    if (codec === "libvpx-vp9") ext = ".webm";
+    if (!path.toLowerCase().endsWith(ext)) {
+      pathInput.value = path.replace(/\.[^.]+$/, ext);
     }
   },
 
@@ -1714,6 +1762,7 @@ const App = {
             crf: parseInt(document.getElementById("renderCrf").value),
             audio: overlayOnly ? "none" : document.querySelector('input[name="renderAudio"]:checked').value,
             overlay_only: overlayOnly,
+            hwaccel_decode: document.getElementById("renderHwaccelDecode")?.checked || false,
             width: videoInfo?.width || 1920, height: videoInfo?.height || 1080,
             fps: parseFloat(document.getElementById("videoFpsOverride").value) || videoInfo?.fps || 29.97,
             start_sec: startSec, end_sec: endSec,
@@ -2003,6 +2052,7 @@ const App = {
       audio: document.querySelector('input[name="renderAudio"]:checked')?.value || "none",
       overlay_only: document.getElementById("renderOverlayOnly")?.checked || false,
       overlay_codec: document.getElementById("renderOverlayCodec")?.value || "qtrle",
+      hwaccel_decode: document.getElementById("renderHwaccelDecode")?.checked || false,
     };
 
     return {
