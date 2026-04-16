@@ -111,6 +111,8 @@ class RenderPipeline:
         batch_size: int = 8,
         progress_callback=None,
         hwaccel_decode: bool = False,
+        use_tick_mode: bool = False,
+        max_ticks: Optional[int] = None,
     ) -> dict:
         self._cancelled = False
         self.logs = []
@@ -149,8 +151,15 @@ class RenderPipeline:
             self.add_log(f"   输出: {output_path}")
             self.add_log(f"   编码: {codec} {preset} crf={crf}")
             self.add_log(f"   画布: {canvas_width}×{canvas_height}")
-            self.add_log(f"   引擎: PyAV {av.__version__} + 多进程流水线" if self._use_multiprocess
-                         else f"   引擎: PyAV {av.__version__} + 串行回退")
+            # 决定使用哪种渲染模式
+            if use_tick_mode:
+                mode_label = "Tick 单线程调试"
+            elif self._use_multiprocess:
+                mode_label = "多进程流水线"
+            else:
+                mode_label = "Tick 单线程（多进程不可用，自动降级）"
+                use_tick_mode = True  # 自动降级
+            self.add_log(f"   引擎: PyAV {av.__version__} + {mode_label}")
 
             # 预计算每帧的 FitRecord
             record_lookup = [None] * total_frames
@@ -164,7 +173,30 @@ class RenderPipeline:
 
             self.add_log(f"✅ 预计算完成: {total_frames} 帧的 FitRecord 查找表")
 
-            assert(self._use_multiprocess)
+            # ── 根据模式选择渲染路径 ──
+            if use_tick_mode:
+                actual_output = self.render_video_tick_mode(
+                    video_path=video_path,
+                    fit_data=fit_data,
+                    widgets=widgets,
+                    time_sync=time_sync,
+                    output_path=output_path,
+                    canvas_width=canvas_width,
+                    canvas_height=canvas_height,
+                    fps=fps,
+                    start_sec=start_sec,
+                    end_sec=end_sec,
+                    codec=codec,
+                    preset=preset,
+                    crf=crf,
+                    audio_mode=audio_mode,
+                    overlay_only=overlay_only,
+                    overlay_codec=overlay_codec,
+                    max_ticks=max_ticks,
+                    hwaccel_decode=hwaccel_decode,
+                )
+                # tick_mode 返回的 result 直接透传
+                return actual_output
 
             actual_output = self._render_pipeline(
                 video_path, fit_data, fit_time_lookup, record_lookup, widgets,

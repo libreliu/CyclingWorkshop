@@ -167,6 +167,8 @@ def render_start():
     hwaccel_decode = render_settings.get("hwaccel_decode", False)  # 硬件加速解码
     num_workers = render_settings.get("num_workers", 4)  # 并行渲染线程数
     batch_size = render_settings.get("batch_size", 8)  # 每批并行帧数
+    render_mode = render_settings.get("render_mode", "pipeline")  # 渲染模式: pipeline | tick
+    max_ticks = render_settings.get("max_ticks", None)  # tick 模式最大轮数（None=无限）
 
     # 创建任务
     task_id = uuid.uuid4().hex[:12]
@@ -199,7 +201,7 @@ def render_start():
             task_id, task, pipeline, fit_data, video_path, widgets, time_sync,
             canvas_width, canvas_height, fps, render_start_sec, render_end_sec,
             output_path, codec, preset, crf, audio_mode, overlay_only, overlay_codec,
-            hwaccel_decode, num_workers, batch_size,
+            hwaccel_decode, num_workers, batch_size, render_mode, max_ticks,
         ),
         daemon=True,
     )
@@ -212,7 +214,7 @@ def _render_worker_v3(
     task_id, task, pipeline, fit_data, video_path, widgets, time_sync,
     canvas_width, canvas_height, fps, start_sec, end_sec,
     output_path, codec, preset, crf, audio_mode, overlay_only, overlay_codec,
-    hwaccel_decode, num_workers, batch_size,
+    hwaccel_decode, num_workers, batch_size, render_mode, max_ticks,
 ):
     """后台渲染线程 — 使用 PyAV 渲染管线（多进程流水线 + 实时日志）"""
 
@@ -254,6 +256,8 @@ def _render_worker_v3(
         batch_size=batch_size,
         progress_callback=progress_callback,
         hwaccel_decode=hwaccel_decode,
+        use_tick_mode=(render_mode == "tick"),
+        max_ticks=max_ticks,
     )
 
     task["status"] = result["status"]

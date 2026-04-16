@@ -1689,6 +1689,15 @@ const App = {
         }
       });
     }
+
+    // 渲染模式联动：tick 模式时显示 maxTicks 输入
+    const renderModeSelect = document.getElementById("renderMode");
+    const maxTicksLabel = document.getElementById("maxTicksLabel");
+    if (renderModeSelect && maxTicksLabel) {
+      renderModeSelect.addEventListener("change", () => {
+        maxTicksLabel.style.display = renderModeSelect.value === "tick" ? "" : "none";
+      });
+    }
   },
 
   /** 根据编码器更新预设选项 */
@@ -1763,6 +1772,8 @@ const App = {
             audio: overlayOnly ? "none" : document.querySelector('input[name="renderAudio"]:checked').value,
             overlay_only: overlayOnly,
             hwaccel_decode: document.getElementById("renderHwaccelDecode")?.checked || false,
+            render_mode: document.getElementById("renderMode")?.value || "pipeline",
+            max_ticks: parseInt(document.getElementById("renderMaxTicks")?.value) || null,
             width: videoInfo?.width || 1920, height: videoInfo?.height || 1080,
             fps: parseFloat(document.getElementById("videoFpsOverride").value) || videoInfo?.fps || 29.97,
             start_sec: startSec, end_sec: endSec,

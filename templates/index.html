@@ -438,6 +438,18 @@
               <input type="checkbox" id="renderHwaccelDecode"> 硬件加速解码
             </label>
           </div>
+          <div class="render-row" style="border:1px dashed #665500; border-radius:4px; padding:6px 10px; background:rgba(255,165,0,0.06);">
+            <label style="color:#cc9900; font-weight:600;" title="Tick 模式：三个 Service 在主线程中按序执行，可断点调试，速度较慢">
+              🐛 渲染模式:
+              <select id="renderMode" style="margin-left:4px;">
+                <option value="pipeline" selected>多进程流水线（默认）</option>
+                <option value="tick">Tick 单线程调试</option>
+              </select>
+            </label>
+            <label id="maxTicksLabel" style="display:none; margin-left:12px; color:#cc9900;" title="限制 Tick 轮数，用于快速验证前几帧">
+              最大轮数: <input type="number" id="renderMaxTicks" value="" min="1" step="1" placeholder="不限" style="width:70px;">
+            </label>
+          </div>
           <div class="render-row">
             <label><input type="radio" name="renderAudio" value="copy" checked> 保留原始音频</label>
             <label><input type="radio" name="renderAudio" value="none"> 无音频</label>
