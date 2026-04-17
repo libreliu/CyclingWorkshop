@@ -1493,6 +1493,16 @@ const App = {
         <div class="edit-grid"><label>标签X偏移: <input type="number" id="we_labelOffsetX" value="${w.style.label_offset_x || 0}" step="1"></label><label>标签Y偏移: <input type="number" id="we_labelOffsetY" value="${w.style.label_offset_y || 0}" step="1"></label></div>
       `;
     }
+    if (w.widget_type === "DistanceCounter") {
+      html += `
+        <label>显示模式:
+          <select id="we_distanceMode">
+            <option value="current" ${(w.style.distance_mode || 'current') === 'current' ? 'selected' : ''}>当前距离</option>
+            <option value="current_total" ${w.style.distance_mode === 'current_total' ? 'selected' : ''}>当前 / 总距离</option>
+          </select>
+        </label>
+      `;
+    }
     if (["SpeedGauge", "HeartRateGauge", "CadenceGauge", "PowerGauge"].includes(w.widget_type)) {
       html += `
         <label>显示样式: <select id="we_format"><option value="number" ${w.style.format !== 'arc' ? 'selected' : ''}>数字</option><option value="arc" ${w.style.format === 'arc' ? 'selected' : ''}>圆弧</option></select></label>
@@ -1549,6 +1559,26 @@ const App = {
             <option value="clock" ${w.style.time_mode === 'clock' ? 'selected' : ''}>24小时制时钟</option>
           </select>
         </label>
+        <label>布局: <select id="we_layout"><option value="centered" ${(w.style.layout || 'centered') !== 'stacked' ? 'selected' : ''}>居中</option><option value="stacked" ${w.style.layout === 'stacked' ? 'selected' : ''}>纵向堆叠</option></select></label>
+        <label>标签: <input type="text" id="we_label" value="${w.style.label || ''}" placeholder="如 TIME"> <small class="text-muted">堆叠布局时显示</small></label>
+        <label>文字对齐: <select id="we_textAlign"><option value="center" ${(w.style.text_align || 'center') === 'center' ? 'selected' : ''}>居中</option><option value="left" ${w.style.text_align === 'left' ? 'selected' : ''}>左对齐</option><option value="right" ${w.style.text_align === 'right' ? 'selected' : ''}>右对齐</option></select></label>
+        <label>时区:
+          <select id="we_timezone">
+            <option value="local" ${(w.style.timezone || 'local') === 'local' ? 'selected' : ''}>FIT 本地时间</option>
+            <option value="UTC" ${w.style.timezone === 'UTC' ? 'selected' : ''}>UTC</option>
+            <option value="Asia/Shanghai" ${w.style.timezone === 'Asia/Shanghai' ? 'selected' : ''}>中国标准时间 (UTC+8)</option>
+            <option value="Asia/Tokyo" ${w.style.timezone === 'Asia/Tokyo' ? 'selected' : ''}>日本标准时间 (UTC+9)</option>
+            <option value="Asia/Kolkata" ${w.style.timezone === 'Asia/Kolkata' ? 'selected' : ''}>印度标准时间 (UTC+5:30)</option>
+            <option value="Europe/London" ${w.style.timezone === 'Europe/London' ? 'selected' : ''}>伦敦 (UTC+0/+1)</option>
+            <option value="Europe/Berlin" ${w.style.timezone === 'Europe/Berlin' ? 'selected' : ''}>中欧时间 (UTC+1/+2)</option>
+            <option value="America/New_York" ${w.style.timezone === 'America/New_York' ? 'selected' : ''}>美东时间 (UTC-5/-4)</option>
+            <option value="America/Los_Angeles" ${w.style.timezone === 'America/Los_Angeles' ? 'selected' : ''}>美西时间 (UTC-8/-7)</option>
+            <option value="Australia/Sydney" ${w.style.timezone === 'Australia/Sydney' ? 'selected' : ''}>悉尼 (UTC+10/+11)</option>
+            <option value="__custom__" ${!['local','UTC','Asia/Shanghai','Asia/Tokyo','Asia/Kolkata','Europe/London','Europe/Berlin','America/New_York','America/Los_Angeles','Australia/Sydney'].includes(w.style.timezone || 'local') ? 'selected' : ''}>自定义…</option>
+          </select>
+          <input type="text" id="we_timezoneCustom" value="${w.style.timezone && !['local','UTC','Asia/Shanghai','Asia/Tokyo','Asia/Kolkata','Europe/London','Europe/Berlin','America/New_York','America/Los_Angeles','Australia/Sydney'].includes(w.style.timezone) ? w.style.timezone : ''}" placeholder="如 Europe/Paris" style="display:none; margin-top:4px;">
+        </label>
+        <div class="edit-grid"><label>标签X偏移: <input type="number" id="we_labelOffsetX" value="${w.style.label_offset_x || 0}" step="1"></label><label>标签Y偏移: <input type="number" id="we_labelOffsetY" value="${w.style.label_offset_y || 0}" step="1"></label></div>
       `;
     }
     if (w.widget_type === "GradientIndicator") {
@@ -1577,6 +1607,19 @@ const App = {
     document.getElementById("widgetEditBody").innerHTML = html;
     this._editingWidget = i;
     document.getElementById("widgetEditModal").style.display = "";
+
+    // 时区下拉框：选择"自定义…"时显示输入框
+    const tzSelect = document.getElementById("we_timezone");
+    if (tzSelect) {
+      const tzCustom = document.getElementById("we_timezoneCustom");
+      if (tzCustom) {
+        tzCustom.style.display = tzSelect.value === "__custom__" ? "" : "none";
+        tzSelect.addEventListener("change", () => {
+          tzCustom.style.display = tzSelect.value === "__custom__" ? "" : "none";
+          if (tzSelect.value === "__custom__") tzCustom.focus();
+        });
+      }
+    }
   },
 
   /** 地图模式下拉框切换回调 */
@@ -1663,12 +1706,23 @@ const App = {
     if (textEl) w.style.text = textEl.value;
     const timeModeEl = document.getElementById("we_timeMode");
     if (timeModeEl) w.style.time_mode = timeModeEl.value;
+    const timezoneEl = document.getElementById("we_timezone");
+    if (timezoneEl) {
+      if (timezoneEl.value === "__custom__") {
+        const customEl = document.getElementById("we_timezoneCustom");
+        w.style.timezone = customEl?.value || "local";
+      } else {
+        w.style.timezone = timezoneEl.value;
+      }
+    }
     const lineColorEl = document.getElementById("we_lineColor");
     if (lineColorEl) w.style.line_color = lineColorEl.value;
     const chartModeEl = document.getElementById("we_chartMode");
     if (chartModeEl) w.style.chart_mode = chartModeEl.value;
     const followWindowEl = document.getElementById("we_followWindow");
     if (followWindowEl) w.style.follow_window = parseInt(followWindowEl.value) || 120;
+    const distanceModeEl = document.getElementById("we_distanceMode");
+    if (distanceModeEl) w.style.distance_mode = distanceModeEl.value;
 
     // MapTrack 概览模式自动宽高比
     if (w.widget_type === "MapTrack" && w.style.auto_aspect && this.state.fitId && (w.style.map_mode || "overview") === "overview") {

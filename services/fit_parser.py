@@ -159,6 +159,26 @@ class FitParserService:
         fit_data.available_fields = sorted(available_fields)
         fit_data.lap_markers = lap_markers
 
+        # ── haversine 全路径积分：计算总距离（辅助信息）+ Distance 回退 ──
+        if records:
+            cum_dist = 0.0
+            prev_lat, prev_lon = None, None
+            has_any_coord = any(r.latitude is not None and r.longitude is not None for r in records)
+            need_distance_fallback = "distance" not in available_fields
+            if has_any_coord:
+                for r in records:
+                    if r.latitude is not None and r.longitude is not None:
+                        if prev_lat is not None and prev_lon is not None:
+                            cum_dist += FitSanitize.haversine(prev_lat, prev_lon, r.latitude, r.longitude)
+                        prev_lat, prev_lon = r.latitude, r.longitude
+                    # 回退：写入每条 record.distance
+                    if need_distance_fallback:
+                        r.distance = cum_dist
+                fit_data.haversine_total_distance = cum_dist
+                if need_distance_fallback:
+                    available_fields.add("distance")
+                    fit_data.available_fields = sorted(available_fields)
+
         return fit_data
 
     @staticmethod

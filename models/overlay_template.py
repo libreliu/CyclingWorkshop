@@ -56,7 +56,7 @@ def _cycling_industrial(w: int, h: int) -> list[WidgetConfig]:
     """
     margin = 20
     gap = 8
-    font_size = 96
+    font_size = 60
     gauge_h = int(font_size * 1.8)
 
     # ── 左上角跟随地图 ──
@@ -102,8 +102,8 @@ def _cycling_industrial(w: int, h: int) -> list[WidgetConfig]:
                 "layout": "stacked", "label": label,
                 "max_val": max_val, "bg_color": "#00000088",
                 "border_radius": 4,
-                "unit_offset_x": 190,
-                "unit_offset_y": -20,
+                "unit_offset_x": 150,
+                "unit_offset_y": -16,
                 "text_align": "left",
             },
         )
@@ -116,6 +116,29 @@ def _cycling_industrial(w: int, h: int) -> list[WidgetConfig]:
     y += gauge_h + gap
     widgets.append(_industrial_gauge("GradientIndicator", "gradient", "GRADE", "%", "#ffaa00", y, 200))
     y += gauge_h + gap
+
+    # for distance widget we want to tune its mode
+    distance_widget = _industrial_gauge("DistanceCounter", "distance", "DISTANCE", "km", "#d4ff00", y, 200)
+    distance_widget.style["distance_mode"] = "current_total"
+    widgets.append(distance_widget)
+    y += gauge_h + gap
+
+    # TimerDisplay: stacked industrial layout, TIME label, left-aligned
+    timer_widget = WidgetConfig(
+        widget_type="TimerDisplay", x=margin + x_extra_margin, y=y,
+        width=col_w - x_extra_margin, height=gauge_h,
+        data_field="time",
+        style={
+            "color": "#ffffff", "font_size": font_size,
+            "font_family": "industrial", "layout": "stacked",
+            "label": "TIME", "text_align": "left",
+            "time_mode": "clock", "timezone": "Asia/Shanghai",
+            "bg_color": "#00000088", "border_radius": 4,
+            "unit_offset_x": 0, "unit_offset_y": 0,
+            "label_offset_x": 0, "label_offset_y": 0,
+        },
+    )
+    widgets.append(timer_widget)
 
     return widgets
 

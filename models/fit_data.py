@@ -130,6 +130,7 @@ class FitData:
     sessions: list = field(default_factory=list)  # list[FitSession]
     lap_markers: list = field(default_factory=list)  # list[datetime]
     available_fields: list = field(default_factory=list)  # 可用数据字段名
+    haversine_total_distance: float = 0.0  # GPS haversine 全路径积分总距离 (m)，辅助信息
     _glitch_cache: dict = field(default=None, repr=False)  # GPS glitch 缓存
     _track_coords_cache: tuple = field(default=None, repr=False)  # 轨迹坐标缓存 (cache_key, coords)
 
@@ -161,6 +162,7 @@ class FitData:
             "sessions": [s.to_dict(include_records=include_records) for s in self.sessions],
             "available_fields": self.available_fields,
             "lap_markers": [t.isoformat() for t in self.lap_markers],
+            "haversine_total_distance": self.haversine_total_distance,
         }
 
     @classmethod
@@ -173,6 +175,7 @@ class FitData:
             sessions=[FitSession.from_dict(s) for s in sessions_data],
             lap_markers=[datetime.fromisoformat(t) for t in lap_data if t],
             available_fields=d.get("available_fields", []),
+            haversine_total_distance=d.get("haversine_total_distance", 0.0),
         )
 
 

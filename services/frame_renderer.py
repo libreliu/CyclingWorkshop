@@ -107,8 +107,7 @@ class FrameRenderer:
         elif wtype == "ElevationGauge":
             FrameRenderer._render_gauge(draw, widget, record, "altitude", lambda v: v)
         elif wtype == "DistanceCounter":
-            FrameRenderer._render_gauge(draw, widget, record, "distance",
-                                        lambda v: v / 1000 if v else 0)  # m → km
+            FrameRenderer._render_distance(draw, widget, record, fit_data)
         elif wtype == "TimerDisplay":
             FrameRenderer._render_timer(draw, widget, record, fit_data, fit_time)
         elif wtype == "GradientIndicator":
@@ -274,6 +273,145 @@ class FrameRenderer:
                 uy = y + th + 2 + unit_offset_y
                 draw.text((ux, uy), unit, font=unit_font, fill=(color[0], color[1], color[2], 180))
 
+
+    @staticmethod
+    def _render_distance(draw, widget, record, fit_data):
+        """渲染距离表盘
+
+        distance_mode:
+          "current"       (默认) - 只显示当前距离，如 "13.5"
+          "current_total"        - 显示当前/总距离，如 "13.5 / 153.8"
+        """
+        style = widget.style
+        distance_mode = style.get("distance_mode", "current")  # "current" | "current_total"
+
+        # 当前距离
+        value = None
+        if record:
+            raw = getattr(record, "distance", None)
+            if raw is not None:
+                value = raw / 1000  # m → km
+
+        # 总距离
+        total_km = None
+        if distance_mode == "current_total" and fit_data:
+            session = fit_data.primary_session
+            # 优先使用 session.total_distance（FIT 文件内置，最可靠）
+            if session and session.total_distance > 0:
+                total_km = session.total_distance / 1000
+            # 回退到 haversine_total_distance（GPS 坐标积分，受 GPS 精度影响）
+            elif fit_data.haversine_total_distance > 0:
+                total_km = fit_data.haversine_total_distance / 1000
+            # 最后回退：取 records 最后一条的 distance
+            elif value is not None and session and session.records:
+                last = session.records[-1]
+                if last and last.distance is not None:
+                    total_km = last.distance / 1000
+
+        if distance_mode == "current_total" and total_km is not None:
+            # ── 模式：当前 / 总距离 ──
+            color = FrameRenderer._parse_color(style.get("color", "#ffffff"), default=(255, 255, 255, 255))
+            font_size = style.get("font_size", 28)
+            font_family = style.get("font_family", "default")
+            layout = style.get("layout", "centered")
+            label = style.get("label", "")
+            text_align = style.get("text_align", "center")
+            unit_offset_x = style.get("unit_offset_x", 0)
+            unit_offset_y = style.get("unit_offset_y", 0)
+            label_offset_x = style.get("label_offset_x", 0)
+            label_offset_y = style.get("label_offset_y", 0)
+
+            decimals = style.get("decimals", 1 if value is not None and isinstance(value, float) else 0)
+            unit = style.get("unit", "km")
+
+            value_font = FrameRenderer._get_font(font_size, font_family)
+            total_font = FrameRenderer._get_font(max(font_size * 2 // 3, 12), font_family)
+            label_font = FrameRenderer._get_font(max(font_size * 3 // 5, 12), font_family)
+            unit_font = FrameRenderer._get_font(max(font_size * 2 // 5, 10), font_family)
+
+            # 格式化当前距离
+            cur_text = f"{value:.{decimals}f}" if value is not None else "--"
+            total_text = f"{total_km:.{decimals}f}"
+
+            def _align(avail_w, item_w, offset_x=0):
+                if text_align == "left":
+                    return 5 + offset_x
+                elif text_align == "right":
+                    return avail_w - item_w + offset_x
+                else:
+                    return (avail_w - item_w) // 2 + offset_x
+
+            if layout == "stacked":
+                # ── stacked 布局 ──
+                y_cursor = 4
+                # 标签
+                if label:
+                    lbbox = draw.textbbox((0, 0), label, font=label_font)
+                    lw = lbbox[2] - lbbox[0]
+                    lx = _align(widget.width, lw, label_offset_x)
+                    label_color = (color[0], color[1], color[2], 160)
+                    draw.text((lx, y_cursor + label_offset_y), label, font=label_font, fill=label_color)
+                    lh = lbbox[3] - lbbox[1]
+                    y_cursor += lh + 2 + label_offset_y
+                y_cursor += 8
+
+                # 当前距离（大号）
+                bbox = draw.textbbox((0, 0), cur_text, font=value_font)
+                tw = bbox[2] - bbox[0]
+                th = bbox[3] - bbox[1]
+                x = _align(widget.width, tw)
+                draw.text((x + 1, y_cursor + 1), cur_text, font=value_font, fill=(0, 0, 0, 180))
+                draw.text((x, y_cursor), cur_text, font=value_font, fill=color)
+                y_cursor += th + 1
+
+                # / 总距离（小号半透明）
+                total_full = f"/ {total_text} {unit}"
+                tbbox = draw.textbbox((0, 0), total_full, font=total_font)
+                ttw = tbbox[2] - tbbox[0]
+                tx = _align(widget.width, ttw, unit_offset_x)
+                ty = y_cursor + unit_offset_y
+                total_color = (color[0], color[1], color[2], 140)
+                draw.text((tx, ty), total_full, font=total_font, fill=total_color)
+            else:
+                # ── centered 布局：当前距离 大号 + /总距离 小号 ──
+                bbox = draw.textbbox((0, 0), cur_text, font=value_font)
+                tw = bbox[2] - bbox[0]
+                th = bbox[3] - bbox[1]
+
+                total_full = f"/ {total_text}"
+                tbbox = draw.textbbox((0, 0), total_full, font=total_font)
+                ttw = tbbox[2] - tbbox[0]
+                tth = tbbox[3] - tbbox[1]
+
+                # 整行居中
+                gap_px = 6
+                total_w = tw + gap_px + ttw
+                start_x = (widget.width - total_w) // 2
+                y = (widget.height - max(th, tth)) // 2
+
+                # 当前距离
+                draw.text((start_x + 1, y + 1), cur_text, font=value_font, fill=(0, 0, 0, 180))
+                draw.text((start_x, y), cur_text, font=value_font, fill=color)
+
+                # / 总距离
+                total_x = start_x + tw + gap_px
+                total_y = y + th - tth  # 底部对齐
+                total_color = (color[0], color[1], color[2], 160)
+                draw.text((total_x, total_y), total_full, font=total_font, fill=total_color)
+
+                # 单位
+                if unit:
+                    full_unit_text = f"{unit}"
+                    ubbox = draw.textbbox((0, 0), full_unit_text, font=unit_font)
+                    uw = ubbox[2] - ubbox[0]
+                    ux = (widget.width - uw) // 2 + unit_offset_x
+                    uy = y + max(th, tth) + 2 + unit_offset_y
+                    draw.text((ux, uy), full_unit_text, font=unit_font, fill=(color[0], color[1], color[2], 180))
+        else:
+            # ── 默认模式：只显示当前距离（走原来的 _render_gauge）──
+            FrameRenderer._render_gauge(draw, widget, record, "distance",
+                                        lambda v: v / 1000)  # m → km
+
     @staticmethod
     def _render_timer(draw, widget, record, fit_data, fit_time):
         """渲染运动时间
@@ -282,7 +420,12 @@ class FrameRenderer:
           "elapsed" (默认) - 从运动开始到现在的时长（HH:MM:SS）
           "clock"           - 当前 24 小时制时间（HH:MM:SS）
 
-        运动未开始时（elapsed < 0）显示 "--:--:--"
+        clock 模式下的时区：
+          style.timezone: "local"（默认，使用 FIT 时间本身的时区）
+                         或 IANA 时区名如 "Asia/Shanghai"、"UTC"、"America/New_York" 等
+
+        支持 style.layout="stacked" 和 style.text_align="left"|"center"|"right"
+        stacked 布局：标签(上) → 时间(中) → 单位(下)
         """
         session = fit_data.primary_session
         if not session or not session.start_time or not fit_time:
@@ -291,14 +434,32 @@ class FrameRenderer:
         style = widget.style
         time_mode = style.get("time_mode", "elapsed")  # "elapsed" | "clock"
         font_family = style.get("font_family", "default")
-        font = FrameRenderer._get_font(style.get("font_size", 24), font_family)
+        font_size = style.get("font_size", 24)
+        font = FrameRenderer._get_font(font_size, font_family)
         color = FrameRenderer._parse_color(style.get("color", "#ffffff"), default=(255, 255, 255, 255))
+        layout = style.get("layout", "centered")
+        text_align = style.get("text_align", "center")
+        label_text = style.get("label", "")
+        unit_offset_x = style.get("unit_offset_x", 0)
+        unit_offset_y = style.get("unit_offset_y", 0)
+        label_offset_x = style.get("label_offset_x", 0)
+        label_offset_y = style.get("label_offset_y", 0)
 
         elapsed = (fit_time - session.start_time).total_seconds()
+        unit = ""
 
         if time_mode == "clock":
-            # 24 小时制当前时间
-            text = fit_time.strftime("%H:%M:%S")
+            # 24 小时制当前时间，支持时区
+            tz_name = style.get("timezone", "local")
+            if tz_name and tz_name != "local":
+                try:
+                    from zoneinfo import ZoneInfo
+                    tz = ZoneInfo(tz_name)
+                    text = fit_time.astimezone(tz).strftime("%H:%M:%S")
+                except Exception:
+                    text = fit_time.strftime("%H:%M:%S")
+            else:
+                text = fit_time.strftime("%H:%M:%S")
         else:
             # 运动时长
             if elapsed < 0:
@@ -308,11 +469,63 @@ class FrameRenderer:
                 minutes = int((elapsed % 3600) // 60)
                 seconds = int(elapsed % 60)
                 text = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+                # 超过 99 小时显示天数
+                if hours >= 100:
+                    days = hours // 24
+                    h_rem = hours % 24
+                    text = f"{days}d {h_rem:02d}:{minutes:02d}:{seconds:02d}"
 
-        bbox = draw.textbbox((0, 0), text, font=font)
-        tw = bbox[2] - bbox[0]
-        th = bbox[3] - bbox[1]
-        draw.text(((widget.width - tw) // 2, (widget.height - th) // 2), text, font=font, fill=color)
+        def _align(avail_w, item_w, offset_x=0):
+            if text_align == "left":
+                return 5 + offset_x
+            elif text_align == "right":
+                return avail_w - item_w + offset_x
+            else:
+                return (avail_w - item_w) // 2 + offset_x
+
+        if layout == "stacked":
+            # ── stacked 布局：标签(上) → 时间(中) → 单位(下) ──
+            y_cursor = 4
+
+            # 标签
+            if label_text:
+                label_font = FrameRenderer._get_font(max(font_size * 3 // 5, 12), font_family)
+                lbbox = draw.textbbox((0, 0), label_text, font=label_font)
+                lw = lbbox[2] - lbbox[0]
+                lx = _align(widget.width, lw, label_offset_x)
+                label_color = (color[0], color[1], color[2], 160)
+                draw.text((lx, y_cursor + label_offset_y), label_text, font=label_font, fill=label_color)
+                lh = lbbox[3] - lbbox[1]
+                y_cursor += lh + 2 + label_offset_y
+
+            y_cursor += 8
+            # 时间（大号）
+            bbox = draw.textbbox((0, 0), text, font=font)
+            tw = bbox[2] - bbox[0]
+            th = bbox[3] - bbox[1]
+            x = _align(widget.width, tw)
+            draw.text((x + 1, y_cursor + 1), text, font=font, fill=(0, 0, 0, 180))
+            draw.text((x, y_cursor), text, font=font, fill=color)
+            y_cursor += th + 1
+
+            # 单位（小号半透明）
+            if unit:
+                unit_font = FrameRenderer._get_font(max(font_size * 2 // 5, 10), font_family)
+                ubbox = draw.textbbox((0, 0), unit, font=unit_font)
+                uw = ubbox[2] - ubbox[0]
+                ux = _align(widget.width, uw, unit_offset_x)
+                uy = y_cursor + unit_offset_y
+                unit_color = (color[0], color[1], color[2], 140)
+                draw.text((ux, uy), unit, font=unit_font, fill=unit_color)
+        else:
+            # ── centered 布局（默认）：居中显示时间 ──
+            bbox = draw.textbbox((0, 0), text, font=font)
+            tw = bbox[2] - bbox[0]
+            th = bbox[3] - bbox[1]
+            x = _align(widget.width, tw)
+            y = (widget.height - th) // 2
+            draw.text((x + 1, y + 1), text, font=font, fill=(0, 0, 0, 180))
+            draw.text((x, y), text, font=font, fill=color)
 
     @staticmethod
     def _render_gradient(draw, widget, record, fit_data, fit_time):
@@ -417,6 +630,8 @@ class FrameRenderer:
             draw.text((lx, y_cursor + label_offset_y), label, font=label_font,
                       fill=(color[0], color[1], color[2], 160))
             y_cursor += lh + 2 + label_offset_y
+
+            y_cursor += 8
 
             # 数值（阴影 + 前景）
             vx = _align(widget.width, tw)
