@@ -130,6 +130,7 @@ def preload_tiles():
     width = data.get("width", 400)
     height = data.get("height", 300)
     task_id = data.get("task_id", "")
+    concurrency = min(max(int(data.get("concurrency", 4)), 1), 32)
 
     if not fit_id:
         return jsonify({"error": "缺少 fit_id"}), 400
@@ -140,7 +141,7 @@ def preload_tiles():
     if not fit_data:
         return jsonify({"error": "FIT 数据未找到，请先在步骤①加载 FIT 文件"}), 400
 
-    result = preload_tiles_for_fit(fit_data, fit_id=fit_id, tile_style=tile_style, zoom=zoom, width=width, height=height, task_id=task_id)
+    result = preload_tiles_for_fit(fit_data, fit_id=fit_id, tile_style=tile_style, zoom=zoom, width=width, height=height, task_id=task_id, concurrency=concurrency)
     if "error" in result:
         return jsonify(result), 400
 
@@ -158,6 +159,7 @@ def preload_region():
     zoom = data.get("zoom", 14)
     tile_style = data.get("tile_style", "carto_dark")
     task_id = data.get("task_id", "")
+    concurrency = min(max(int(data.get("concurrency", 4)), 1), 32)
 
     if None in (min_lat, max_lat, min_lon, max_lon):
         return jsonify({"error": "缺少区域参数"}), 400
@@ -173,7 +175,7 @@ def preload_region():
     from services.tile_service import download_tiles_batch
 
     def _async_download():
-        download_tiles_batch(urls, task_id=task_id)
+        download_tiles_batch(urls, task_id=task_id, concurrency=concurrency)
 
     t = threading.Thread(target=_async_download, daemon=True)
     t.start()
@@ -300,7 +302,7 @@ def cache_region():
 def cache_region_download():
     """下载指定区域瓦片（通过区域选择框触发）
 
-    Body: {min_lat, max_lat, min_lon, max_lon, zoom, tile_style}
+    Body: {min_lat, max_lat, min_lon, max_lon, zoom, tile_style, concurrency}
     """
     data = request.get_json(force=True)
     min_lat = data.get("min_lat")
@@ -309,6 +311,7 @@ def cache_region_download():
     max_lon = data.get("max_lon")
     zoom = data.get("zoom", 14)
     tile_style = data.get("tile_style", "carto_dark")
+    concurrency = min(max(int(data.get("concurrency", 4)), 1), 32)
 
     if None in (min_lat, max_lat, min_lon, max_lon):
         return jsonify({"error": "缺少区域参数"}), 400
@@ -326,7 +329,7 @@ def cache_region_download():
     task_id = f"region_{tile_style}_z{zoom}_{int(time.time()*1000)}"
 
     def _async_download():
-        download_tiles_batch(urls, task_id=task_id)
+        download_tiles_batch(urls, task_id=task_id, concurrency=concurrency)
 
     t = threading.Thread(target=_async_download, daemon=True)
     t.start()

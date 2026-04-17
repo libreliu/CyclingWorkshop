@@ -288,6 +288,7 @@ const TileManager = {
     const maxLon = parseFloat(document.getElementById("regionMaxLon").value);
     const zoom = parseInt(document.getElementById("regionZoom").value) || 0;
     const tileStyle = document.getElementById("regionStyle").value;
+    const concurrency = parseInt(document.getElementById("regionConcurrency").value) || 4;
 
     if (isNaN(minLat) || isNaN(maxLat) || isNaN(minLon) || isNaN(maxLon)) {
       App.toast("请先在地图上 Shift+拖拽 选择区域", "warning");
@@ -298,7 +299,7 @@ const TileManager = {
       const result = await API.downloadRegion({
         min_lat: minLat, max_lat: maxLat,
         min_lon: minLon, max_lon: maxLon,
-        zoom, tile_style: tileStyle,
+        zoom, tile_style: tileStyle, concurrency,
       });
       App.toast(`开始下载 ${result.total_tiles} 个瓦片 (${result.style_name}, zoom=${result.zoom})`, "success");
       this.state.tasks[result.task_id] = result;
@@ -332,6 +333,7 @@ const TileManager = {
 
     const tileStyle = document.getElementById("preloadStyle").value;
     const zoom = parseInt(document.getElementById("preloadZoom").value) || 0;
+    const concurrency = parseInt(document.getElementById("preloadConcurrency").value) || 4;
 
     try {
       const result = await API.preloadTiles({
@@ -340,6 +342,7 @@ const TileManager = {
         zoom: zoom,
         width: 400,
         height: 300,
+        concurrency,
       });
       App.toast(`开始下载 ${result.total_tiles} 个瓦片 (${result.style_name}, zoom=${result.zoom})`, "success");
       this.state.tasks[result.task_id] = result;
@@ -357,6 +360,7 @@ const TileManager = {
     }
 
     const zoom = parseInt(document.getElementById("preloadZoom").value) || 0;
+    const concurrency = parseInt(document.getElementById("preloadConcurrency").value) || 4;
     const styles = ["carto_dark", "carto_light", "osm", "stamen_terrain", "esri_satellite"];
 
     for (const style of styles) {
@@ -367,6 +371,7 @@ const TileManager = {
           zoom: zoom,
           width: 400,
           height: 300,
+          concurrency,
         });
         App.toast(`${result.style_name}: ${result.total_tiles} 个瓦片 (zoom=${result.zoom})`, "info");
         this.state.tasks[result.task_id] = result;
@@ -398,6 +403,7 @@ const TileManager = {
             </select>
           </label>
           <label>缩放级别: <input type="number" id="preloadZoom" value="0" min="0" max="18" step="1"> <small class="text-muted">(0=自动)</small></label>
+          <label>并发线程: <input type="number" id="preloadConcurrency" value="4" min="1" max="32" step="1"></label>
         </div>
         <div class="preload-actions">
           <button onclick="TileManager.preloadForFit()" class="btn-primary" ${!fitLoaded ? 'disabled title="请先加载 FIT 文件"' : ''}>下载选中样式</button>

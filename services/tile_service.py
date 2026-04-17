@@ -240,7 +240,7 @@ def download_tile(url: str, timeout: int = 15, retries: int = 2) -> Image.Image:
     return Image.new("RGBA", (256, 256), (60, 60, 80, 255))
 
 
-def download_tiles_batch(urls: list, task_id: str = "", timeout: int = 15,
+def download_tiles_batch(urls: list, task_id: str = "", timeout: int = 5,
                          concurrency: int = 4) -> Dict[str, Any]:
     """批量下载瓦片，支持进度追踪
 
@@ -248,18 +248,20 @@ def download_tiles_batch(urls: list, task_id: str = "", timeout: int = 15,
         urls: 瓦片 URL 列表
         task_id: 进度追踪任务 ID
         timeout: 单个瓦片下载超时
-        concurrency: 并发下载数
+        concurrency: 并发下载数（线程数）
 
     Returns:
         {"total": N, "completed": N, "failed": N, "cached": N}
     """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
     progress = TileDownloadProgress.get_instance()
 
     if not task_id:
         task_id = f"dl_{int(time.time()*1000)}"
 
     total = len(urls)
-    progress.start_task(task_id, total, description=f"下载 {total} 个瓦片")
+    progress.start_task(task_id, total, description=f"下载 {total} 个瓦片 (×{concurrency})")
 
     # 检查已缓存的
     to_download = []
@@ -269,13 +271,17 @@ def download_tiles_batch(urls: list, task_id: str = "", timeout: int = 15,
         else:
             to_download.append(url)
 
-    # 使用线程池并发下载
+    # 使用 ThreadPoolExecutor 并发下载
     completed = 0
     failed = 0
     lock = threading.Lock()
 
     def _download_one(url):
         nonlocal completed, failed
+        # 检查取消
+        task = progress.get_task(task_id)
+        if task and task["status"] == "cancelled":
+            return
         try:
             download_tile(url, timeout=timeout)
             with lock:
@@ -286,27 +292,21 @@ def download_tiles_batch(urls: list, task_id: str = "", timeout: int = 15,
                 failed += 1
                 progress.update(task_id, failed_delta=1, error_msg=str(e))
 
-    # 简单的线程池
-    threads = []
-    for i, url in enumerate(to_download):
-        # 检查取消
-        task = progress.get_task(task_id)
-        if task and task["status"] == "cancelled":
-            break
+    with ThreadPoolExecutor(max_workers=concurrency) as executor:
+        futures = []
+        for url in to_download:
+            # 提交前检查取消
+            task = progress.get_task(task_id)
+            if task and task["status"] == "cancelled":
+                break
+            futures.append(executor.submit(_download_one, url))
 
-        t = threading.Thread(target=_download_one, args=(url,))
-        t.start()
-        threads.append(t)
-
-        # 控制并发
-        if len(threads) >= concurrency:
-            for t in threads:
-                t.join(timeout=timeout + 5)
-            threads = []
-
-    # 等待剩余线程
-    for t in threads:
-        t.join(timeout=timeout + 5)
+        # 等待所有已提交任务完成
+        for future in as_completed(futures, timeout=timeout * len(to_download) + 30):
+            try:
+                future.result()
+            except Exception:
+                pass
 
     task = progress.get_task(task_id)
     if task and task["status"] == "running":
@@ -672,6 +672,7 @@ def preload_tiles_for_fit(
     width: int = 400,
     height: int = 300,
     task_id: str = "",
+    concurrency: int = 4,
 ) -> Dict[str, Any]:
     """为 FIT 轨迹预下载所需瓦片
 
@@ -683,6 +684,7 @@ def preload_tiles_for_fit(
         width: 渲染宽度
         height: 渲染高度
         task_id: 可选任务 ID
+        concurrency: 并发下载数（线程数）
 
     Returns:
         {"task_id": ..., "total": N, "style": ..., "zoom": ...}
@@ -707,7 +709,7 @@ def preload_tiles_for_fit(
 
     # 启动异步下载
     def _async_download():
-        download_tiles_batch(urls, task_id=task_id)
+        download_tiles_batch(urls, task_id=task_id, concurrency=concurrency)
 
     t = threading.Thread(target=_async_download, daemon=True)
     t.start()

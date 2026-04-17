@@ -1403,16 +1403,16 @@ const App = {
     const h = this.state.videoInfo?.height || 1080;
     const defaults = {
       MapTrack: { width: 300, height: 225, style: { map_style: "dark", track_color: "#00d4aa", marker_color: "#ff4444", marker_size: 6, auto_aspect: true } },
-      SpeedGauge: { width: 150, height: 80, style: { color: "#00d4aa", font_size: 32, unit: "km/h", format: "arc", min_val: 0, max_val: 80 } },
-      HeartRateGauge: { width: 150, height: 80, style: { color: "#ff4444", font_size: 32, unit: "bpm", format: "arc", min_val: 40, max_val: 200 } },
-      CadenceGauge: { width: 150, height: 80, style: { color: "#4488ff", font_size: 32, unit: "rpm", format: "arc", min_val: 0, max_val: 150 } },
-      PowerGauge: { width: 150, height: 80, style: { color: "#ffaa00", font_size: 32, unit: "W", format: "arc", min_val: 0, max_val: 400 } },
-      ElevationGauge: { width: 130, height: 50, style: { color: "#aa88ff", font_size: 24, unit: "m" } },
+      SpeedGauge: { width: 150, height: 80, style: { color: "#00d4aa", font_size: 32, unit: "km/h", format: "arc", font_family: "default", min_val: 0, max_val: 80 } },
+      HeartRateGauge: { width: 150, height: 80, style: { color: "#ff4444", font_size: 32, unit: "bpm", format: "arc", font_family: "default", min_val: 40, max_val: 200 } },
+      CadenceGauge: { width: 150, height: 80, style: { color: "#4488ff", font_size: 32, unit: "rpm", format: "arc", font_family: "default", min_val: 0, max_val: 150 } },
+      PowerGauge: { width: 150, height: 80, style: { color: "#ffaa00", font_size: 32, unit: "W", format: "arc", font_family: "default", min_val: 0, max_val: 400 } },
+      ElevationGauge: { width: 130, height: 50, style: { color: "#aa88ff", font_size: 24, unit: "m", font_family: "default" } },
       AltitudeChart: { width: 300, height: 80, style: { line_color: "#aa88ff", fill_color: "#aa88ff30" } },
-      DistanceCounter: { width: 130, height: 50, style: { color: "#ffffff", font_size: 24, unit: "km" } },
-      TimerDisplay: { width: 130, height: 40, style: { color: "#ffffff", font_size: 22 } },
-      GradientIndicator: { width: 100, height: 40, style: { color: "#ffaa00", font_size: 24, unit: "%" } },
-      CustomLabel: { width: 150, height: 30, style: { color: "#ffffff", font_size: 16, text: "Label" } },
+      DistanceCounter: { width: 130, height: 50, style: { color: "#ffffff", font_size: 24, unit: "km", font_family: "default" } },
+      TimerDisplay: { width: 130, height: 40, style: { color: "#ffffff", font_size: 22, font_family: "default" } },
+      GradientIndicator: { width: 100, height: 40, style: { color: "#ffaa00", font_size: 24, unit: "%", font_family: "default" } },
+      CustomLabel: { width: 150, height: 30, style: { color: "#ffffff", font_size: 16, text: "Label", font_family: "default" } },
     };
     const def = defaults[type] || { width: 120, height: 60, style: {} };
     const widget = {
@@ -1481,8 +1481,18 @@ const App = {
       <label>透明度: <input type="range" id="we_opacity" min="0" max="1" step="0.05" value="${w.opacity}"></label>
       <label>文字颜色: <input type="color" id="we_color" value="${(w.style.color || '#00d4aa').slice(0,7)}"></label>
       <label>字体大小: <input type="number" id="we_fontSize" value="${w.style.font_size || 28}"></label>
+      <label>字体风格: <select id="we_fontFamily"><option value="default" ${w.style.font_family !== 'industrial' ? 'selected' : ''}>默认</option><option value="industrial" ${w.style.font_family === 'industrial' ? 'selected' : ''}>工业粗体</option></select></label>
       <label>单位: <input type="text" id="we_unit" value="${w.style.unit || ''}"></label>
     `;
+    if (["SpeedGauge", "HeartRateGauge", "CadenceGauge", "PowerGauge", "ElevationGauge", "DistanceCounter"].includes(w.widget_type)) {
+      html += `
+        <label>布局: <select id="we_layout"><option value="centered" ${(w.style.layout || 'centered') !== 'stacked' ? 'selected' : ''}>居中</option><option value="stacked" ${w.style.layout === 'stacked' ? 'selected' : ''}>纵向堆叠</option></select></label>
+        <label>标签: <input type="text" id="we_label" value="${w.style.label || ''}" placeholder="如 POWER, KM/H"> <small class="text-muted">堆叠布局时显示</small></label>
+        <label>文字对齐: <select id="we_textAlign"><option value="center" ${(w.style.text_align || 'center') === 'center' ? 'selected' : ''}>居中</option><option value="left" ${w.style.text_align === 'left' ? 'selected' : ''}>左对齐</option><option value="right" ${w.style.text_align === 'right' ? 'selected' : ''}>右对齐</option></select></label>
+        <div class="edit-grid"><label>单位X偏移: <input type="number" id="we_unitOffsetX" value="${w.style.unit_offset_x || 0}" step="1"></label><label>单位Y偏移: <input type="number" id="we_unitOffsetY" value="${w.style.unit_offset_y || 0}" step="1"></label></div>
+        <div class="edit-grid"><label>标签X偏移: <input type="number" id="we_labelOffsetX" value="${w.style.label_offset_x || 0}" step="1"></label><label>标签Y偏移: <input type="number" id="we_labelOffsetY" value="${w.style.label_offset_y || 0}" step="1"></label></div>
+      `;
+    }
     if (["SpeedGauge", "HeartRateGauge", "CadenceGauge", "PowerGauge"].includes(w.widget_type)) {
       html += `
         <label>显示样式: <select id="we_format"><option value="number" ${w.style.format !== 'arc' ? 'selected' : ''}>数字</option><option value="arc" ${w.style.format === 'arc' ? 'selected' : ''}>圆弧</option></select></label>
@@ -1511,14 +1521,58 @@ const App = {
         </label>
         <label>缩放级别: <input type="number" id="we_zoom" value="${w.style.zoom || 0}" min="0" max="18" step="1"> <small class="text-muted">(0=自动)</small></label>
         <label>跟随缩放: <input type="number" id="we_followZoom" value="${w.style.follow_zoom || 15}" min="10" max="18" step="1"> <small class="text-muted">(地图跟随模式)</small></label>
+        <label>跟随放大: <input type="number" id="we_followScale" value="${w.style.follow_scale || 1.0}" min="1" max="4" step="0.5"> <small class="text-muted">(1=原始, 2=2倍放大底图文字)</small></label>
         <label id="we_autoAspectLabel"><input type="checkbox" id="we_autoAspect" ${(w.style.map_mode || "overview") === "follow" ? 'disabled' : ''} ${w.style.auto_aspect !== false ? 'checked' : ''}> 自动匹配轨迹宽高比</label>
+        <hr style="margin:6px 0;border-color:#444">
+        <label>地图形状:
+          <select id="we_mapShape">
+            <option value="rect" ${(w.style.map_shape || 'rect') === 'rect' ? 'selected' : ''}>方形（圆角）</option>
+            <option value="circle" ${w.style.map_shape === 'circle' ? 'selected' : ''}>圆形</option>
+          </select>
+        </label>
+        <label>边框宽度: <input type="number" id="we_borderWidth" value="${w.style.border_width || 0}" min="0" max="20" step="1"> <small class="text-muted">px，0=无边框</small></label>
+        <label>边框颜色: <input type="color" id="we_borderColor" value="${(w.style.border_color || '#ffffff').slice(0,7)}"></label>
+        <label>内侧晕圈: <input type="number" id="we_borderGlow" value="${w.style.border_glow || 0}" min="0" max="40" step="2"> <small class="text-muted">px，边缘向内渐变透明</small></label>
+        <hr style="margin:6px 0;border-color:#444">
+        <label>全轨迹线宽: <input type="number" id="we_trackWidth" value="${w.style.track_width || 2}" min="1" max="10" step="1"> <small class="text-muted">px</small></label>
+        <label>已走线宽: <input type="number" id="we_walkedWidth" value="${w.style.walked_width || 3}" min="1" max="12" step="1"> <small class="text-muted">px</small></label>
       `;
     }
     if (w.widget_type === "CustomLabel") {
       html += `<label>文字: <input type="text" id="we_text" value="${w.style.text || 'Label'}"></label>`;
     }
+    if (w.widget_type === "TimerDisplay") {
+      html += `
+        <label>时间模式:
+          <select id="we_timeMode">
+            <option value="elapsed" ${(w.style.time_mode || 'elapsed') === 'elapsed' ? 'selected' : ''}>运动时长</option>
+            <option value="clock" ${w.style.time_mode === 'clock' ? 'selected' : ''}>24小时制时钟</option>
+          </select>
+        </label>
+      `;
+    }
+    if (w.widget_type === "GradientIndicator") {
+      html += `
+        <label>布局: <select id="we_layout"><option value="centered" ${(w.style.layout || 'centered') !== 'stacked' ? 'selected' : ''}>居中</option><option value="stacked" ${w.style.layout === 'stacked' ? 'selected' : ''}>纵向堆叠</option></select></label>
+        <label>标签: <input type="text" id="we_label" value="${w.style.label || ''}" placeholder="如 GRADE"> <small class="text-muted">堆叠布局时显示</small></label>
+        <label>文字对齐: <select id="we_textAlign"><option value="center" ${(w.style.text_align || 'center') === 'center' ? 'selected' : ''}>居中</option><option value="left" ${w.style.text_align === 'left' ? 'selected' : ''}>左对齐</option><option value="right" ${w.style.text_align === 'right' ? 'selected' : ''}>右对齐</option></select></label>
+        <label>单位偏移X: <input type="number" id="we_unitOffsetX" value="${w.style.unit_offset_x || 0}" step="5"> <small class="text-muted">px</small></label>
+        <label>单位偏移Y: <input type="number" id="we_unitOffsetY" value="${w.style.unit_offset_y || 0}" step="2"> <small class="text-muted">px</small></label>
+        <label>标签偏移X: <input type="number" id="we_labelOffsetX" value="${w.style.label_offset_x || 0}" step="5"> <small class="text-muted">px</small></label>
+        <label>窗口秒数: <input type="number" id="we_gradientWindow" value="${w.style.gradient_window || 5}" min="1" max="30"> <small class="text-muted">前后取N秒海拔计算</small></label>
+      `;
+    }
     if (w.widget_type === "AltitudeChart") {
-      html += `<label>线条颜色: <input type="color" id="we_lineColor" value="${(w.style.line_color || '#aa88ff').slice(0,7)}"></label>`;
+      html += `
+        <label>线条颜色: <input type="color" id="we_lineColor" value="${(w.style.line_color || '#aa88ff').slice(0,7)}"></label>
+        <label>显示模式:
+          <select id="we_chartMode">
+            <option value="full" ${(w.style.chart_mode || 'full') === 'full' ? 'selected' : ''}>全程总览</option>
+            <option value="follow" ${w.style.chart_mode === 'follow' ? 'selected' : ''}>跟随（局部窗口）</option>
+          </select>
+        </label>
+        <label>窗口秒数: <input type="number" id="we_followWindow" value="${w.style.follow_window || 120}" min="30" max="600" step="10"> <small class="text-muted">跟随模式下显示的前后时间范围（秒）</small></label>
+      `;
     }
     document.getElementById("widgetEditBody").innerHTML = html;
     this._editingWidget = i;
@@ -1548,7 +1602,13 @@ const App = {
     w.opacity = parseFloat(document.getElementById("we_opacity").value);
     w.style.color = document.getElementById("we_color").value;
     w.style.font_size = parseInt(document.getElementById("we_fontSize").value) || 28;
+    const fontFamilyEl = document.getElementById("we_fontFamily");
+    if (fontFamilyEl) w.style.font_family = fontFamilyEl.value;
     w.style.unit = document.getElementById("we_unit").value;
+    const layoutEl = document.getElementById("we_layout");
+    if (layoutEl) w.style.layout = layoutEl.value;
+    const labelEl = document.getElementById("we_label");
+    if (labelEl) w.style.label = labelEl.value;
     const formatEl = document.getElementById("we_format");
     if (formatEl) w.style.format = formatEl.value;
     const minValEl = document.getElementById("we_minVal");
@@ -1567,6 +1627,32 @@ const App = {
     if (mapModeEl) w.style.map_mode = mapModeEl.value;
     const followZoomEl = document.getElementById("we_followZoom");
     if (followZoomEl) w.style.follow_zoom = parseInt(followZoomEl.value) || 15;
+    const followScaleEl = document.getElementById("we_followScale");
+    if (followScaleEl) w.style.follow_scale = parseFloat(followScaleEl.value) || 1.0;
+    const mapShapeEl = document.getElementById("we_mapShape");
+    if (mapShapeEl) w.style.map_shape = mapShapeEl.value;
+    const borderWidthEl = document.getElementById("we_borderWidth");
+    if (borderWidthEl) w.style.border_width = parseInt(borderWidthEl.value) || 0;
+    const borderColorEl = document.getElementById("we_borderColor");
+    if (borderColorEl) w.style.border_color = borderColorEl.value;
+    const borderGlowEl = document.getElementById("we_borderGlow");
+    if (borderGlowEl) w.style.border_glow = parseInt(borderGlowEl.value) || 0;
+    const trackWidthEl = document.getElementById("we_trackWidth");
+    if (trackWidthEl) w.style.track_width = parseInt(trackWidthEl.value) || 2;
+    const walkedWidthEl = document.getElementById("we_walkedWidth");
+    if (walkedWidthEl) w.style.walked_width = parseInt(walkedWidthEl.value) || 3;
+    const unitOffsetXEl = document.getElementById("we_unitOffsetX");
+    if (unitOffsetXEl) w.style.unit_offset_x = parseInt(unitOffsetXEl.value) || 0;
+    const unitOffsetYEl = document.getElementById("we_unitOffsetY");
+    if (unitOffsetYEl) w.style.unit_offset_y = parseInt(unitOffsetYEl.value) || 0;
+    const labelOffsetXEl = document.getElementById("we_labelOffsetX");
+    if (labelOffsetXEl) w.style.label_offset_x = parseInt(labelOffsetXEl.value) || 0;
+    const labelOffsetYEl = document.getElementById("we_labelOffsetY");
+    if (labelOffsetYEl) w.style.label_offset_y = parseInt(labelOffsetYEl.value) || 0;
+    const gradientWindowEl = document.getElementById("we_gradientWindow");
+    if (gradientWindowEl) w.style.gradient_window = parseInt(gradientWindowEl.value) || 5;
+    const textAlignEl = document.getElementById("we_textAlign");
+    if (textAlignEl) w.style.text_align = textAlignEl.value;
     const autoAspectEl = document.getElementById("we_autoAspect");
     if (autoAspectEl) w.style.auto_aspect = autoAspectEl.checked;
     // 跟随模式强制关闭自动宽高比
@@ -1575,8 +1661,14 @@ const App = {
     }
     const textEl = document.getElementById("we_text");
     if (textEl) w.style.text = textEl.value;
+    const timeModeEl = document.getElementById("we_timeMode");
+    if (timeModeEl) w.style.time_mode = timeModeEl.value;
     const lineColorEl = document.getElementById("we_lineColor");
     if (lineColorEl) w.style.line_color = lineColorEl.value;
+    const chartModeEl = document.getElementById("we_chartMode");
+    if (chartModeEl) w.style.chart_mode = chartModeEl.value;
+    const followWindowEl = document.getElementById("we_followWindow");
+    if (followWindowEl) w.style.follow_window = parseInt(followWindowEl.value) || 120;
 
     // MapTrack 概览模式自动宽高比
     if (w.widget_type === "MapTrack" && w.style.auto_aspect && this.state.fitId && (w.style.map_mode || "overview") === "overview") {
