@@ -1,7 +1,9 @@
 """FIT 文件解析服务"""
 import copy
+import contextlib
 import math
 import os
+import threading
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -23,8 +25,184 @@ SPORT_MAP = {
 }
 
 
+_FIT_TOOL_PATCH_LOCK = threading.RLock()
+_FIT_TOOL_OPTIMIZED_FACTORY = None
+_FIT_TOOL_ORIGINAL_FACTORY = None
+
+
+def _ensure_optimized_fit_tool_record_factory():
+    """安装 fit_tool 的轻量 RecordMessage 工厂。
+
+    `fit_tool` 默认会为每条 record 构造 70+ 个字段对象，而 CyclingWorkshop
+    实际只读取十来个常用字段。这里将 RecordMessage 缩减为项目真正需要的
+    字段集合，避免在 47k+ 条记录上重复做无用对象创建。
+    """
+    global _FIT_TOOL_OPTIMIZED_FACTORY, _FIT_TOOL_ORIGINAL_FACTORY
+
+    with _FIT_TOOL_PATCH_LOCK:
+        if _FIT_TOOL_OPTIMIZED_FACTORY is not None:
+            return _FIT_TOOL_OPTIMIZED_FACTORY
+
+        from fit_tool.data_message import DataMessage
+        from fit_tool.profile.messages.message_factory import MessageFactory
+        from fit_tool.profile.messages.record_message import (
+            RecordMessage as FitToolRecordMessage,
+            TimestampField,
+            RecordPositionLatField,
+            RecordPositionLongField,
+            RecordAltitudeField,
+            RecordHeartRateField,
+            RecordCadenceField,
+            RecordDistanceField,
+            RecordSpeedField,
+            RecordPowerField,
+            RecordTemperatureField,
+            RecordGradeField,
+            RecordEnhancedSpeedField,
+            RecordEnhancedAltitudeField,
+        )
+
+        _FIT_TOOL_ORIGINAL_FACTORY = MessageFactory.from_definition
+
+        class SlimRecordMessage(DataMessage):
+            NAME = FitToolRecordMessage.NAME
+            ID = FitToolRecordMessage.ID
+
+            def __init__(self, definition_message=None, developer_fields=None, local_id: int = 0, endian=None):
+                size_by_id = {}
+                if definition_message is not None:
+                    size_by_id = {
+                        field_definition.field_id: field_definition.size
+                        for field_definition in definition_message.field_definitions
+                    }
+
+                def field_size(field_id: int) -> int:
+                    return size_by_id.get(field_id, 0)
+
+                super().__init__(
+                    name=SlimRecordMessage.NAME,
+                    global_id=SlimRecordMessage.ID,
+                    local_id=definition_message.local_id if definition_message else local_id,
+                    endian=definition_message.endian if definition_message else endian,
+                    definition_message=definition_message,
+                    developer_fields=developer_fields,
+                    fields=[
+                        TimestampField(size=field_size(TimestampField.ID), growable=definition_message is None),
+                        RecordPositionLatField(size=field_size(RecordPositionLatField.ID), growable=definition_message is None),
+                        RecordPositionLongField(size=field_size(RecordPositionLongField.ID), growable=definition_message is None),
+                        RecordAltitudeField(size=field_size(RecordAltitudeField.ID), growable=definition_message is None),
+                        RecordHeartRateField(size=field_size(RecordHeartRateField.ID), growable=definition_message is None),
+                        RecordCadenceField(size=field_size(RecordCadenceField.ID), growable=definition_message is None),
+                        RecordDistanceField(size=field_size(RecordDistanceField.ID), growable=definition_message is None),
+                        RecordSpeedField(size=field_size(RecordSpeedField.ID), growable=definition_message is None),
+                        RecordPowerField(size=field_size(RecordPowerField.ID), growable=definition_message is None),
+                        RecordTemperatureField(size=field_size(RecordTemperatureField.ID), growable=definition_message is None),
+                        RecordGradeField(size=field_size(RecordGradeField.ID), growable=definition_message is None),
+                        RecordEnhancedSpeedField(size=field_size(RecordEnhancedSpeedField.ID), growable=definition_message is None),
+                        RecordEnhancedAltitudeField(size=field_size(RecordEnhancedAltitudeField.ID), growable=definition_message is None),
+                    ],
+                )
+                self._field_map = {field.field_id: field for field in self.fields}
+
+            def get_field(self, field_id: int):
+                return self._field_map.get(field_id)
+
+            def _value(self, field_id: int):
+                field = self._field_map.get(field_id)
+                if field and field.is_valid():
+                    sub_field = field.get_valid_sub_field(self.fields)
+                    return field.get_value(sub_field=sub_field)
+                return None
+
+            @property
+            def timestamp(self):
+                return self._value(TimestampField.ID)
+
+            @property
+            def position_lat(self):
+                return self._value(RecordPositionLatField.ID)
+
+            @property
+            def position_long(self):
+                return self._value(RecordPositionLongField.ID)
+
+            @property
+            def altitude(self):
+                return self._value(RecordAltitudeField.ID)
+
+            @property
+            def enhanced_altitude(self):
+                return self._value(RecordEnhancedAltitudeField.ID)
+
+            @property
+            def heart_rate(self):
+                return self._value(RecordHeartRateField.ID)
+
+            @property
+            def cadence(self):
+                return self._value(RecordCadenceField.ID)
+
+            @property
+            def distance(self):
+                return self._value(RecordDistanceField.ID)
+
+            @property
+            def speed(self):
+                return self._value(RecordSpeedField.ID)
+
+            @property
+            def enhanced_speed(self):
+                return self._value(RecordEnhancedSpeedField.ID)
+
+            @property
+            def power(self):
+                return self._value(RecordPowerField.ID)
+
+            @property
+            def temperature(self):
+                return self._value(RecordTemperatureField.ID)
+
+            @property
+            def grade(self):
+                return self._value(RecordGradeField.ID)
+
+        def optimized_from_definition(definition_message, developer_fields):
+            if definition_message.global_id == FitToolRecordMessage.ID:
+                return SlimRecordMessage(
+                    definition_message=definition_message,
+                    developer_fields=developer_fields,
+                )
+            return _FIT_TOOL_ORIGINAL_FACTORY(definition_message, developer_fields)
+
+        _FIT_TOOL_OPTIMIZED_FACTORY = optimized_from_definition
+        MessageFactory.from_definition = staticmethod(optimized_from_definition)
+        return _FIT_TOOL_OPTIMIZED_FACTORY
+
+
+@contextlib.contextmanager
+def fit_tool_record_factory_optimization(enabled: bool = True):
+    """测试/基准用：临时切换 fit_tool RecordMessage 优化开关。"""
+    with _FIT_TOOL_PATCH_LOCK:
+        _ensure_optimized_fit_tool_record_factory()
+
+        from fit_tool.profile.messages.message_factory import MessageFactory
+
+        previous_factory = MessageFactory.from_definition
+        target_factory = _FIT_TOOL_OPTIMIZED_FACTORY if enabled else _FIT_TOOL_ORIGINAL_FACTORY
+        MessageFactory.from_definition = staticmethod(target_factory)
+        try:
+            yield
+        finally:
+            MessageFactory.from_definition = staticmethod(previous_factory)
+
+
 class FitParserService:
     """FIT 文件解析"""
+
+    _GRADIENT_WINDOW_M = 12.0
+    _GRADIENT_MIN_DISTANCE_M = 4.0
+    _GRADIENT_STOP_SPEED_MS = 0.8
+    _GRADIENT_SMOOTH_RADIUS = 2
 
     @staticmethod
     def parse(file_path: str) -> Optional[FitData]:
@@ -34,6 +212,11 @@ class FitParserService:
 
         try:
             from fit_tool.fit_file import FitFile
+            from fit_tool.profile.messages.record_message import RecordMessage as FitToolRecordMessage
+            from fit_tool.profile.messages.session_message import SessionMessage as FitToolSessionMessage
+            from fit_tool.profile.messages.lap_message import LapMessage as FitToolLapMessage
+
+            _ensure_optimized_fit_tool_record_factory()
             print(f"[FitParser] 开始解析文件: {file_path}")
             fit_file = FitFile.from_file(file_path)
             print(f"[FitParser] 解析完成: {file_path}")
@@ -55,7 +238,9 @@ class FitParserService:
             if msg_type == "DefinitionMessage":
                 continue
 
-            if msg_type == "SessionMessage":
+            msg_global_id = getattr(msg, "global_id", None)
+
+            if msg_global_id == FitToolSessionMessage.ID or msg_type == "SessionMessage":
                 session = FitSession()
                 session.sport = SPORT_MAP.get(getattr(msg, 'sport', None), "unknown")
                 raw_start = getattr(msg, 'start_time', None)
@@ -67,15 +252,19 @@ class FitParserService:
                 session.total_descent = float(getattr(msg, 'total_descent', 0) or 0)
                 session.avg_heart_rate = getattr(msg, 'avg_heart_rate', None)
                 session.max_heart_rate = getattr(msg, 'max_heart_rate', None)
-                raw_avg_speed = getattr(msg, 'avg_speed', None)
-                raw_max_speed = getattr(msg, 'max_speed', None)
+                raw_avg_speed = getattr(msg, 'enhanced_avg_speed', None)
+                if raw_avg_speed is None:
+                    raw_avg_speed = getattr(msg, 'avg_speed', None)
+                raw_max_speed = getattr(msg, 'enhanced_max_speed', None)
+                if raw_max_speed is None:
+                    raw_max_speed = getattr(msg, 'max_speed', None)
                 session.avg_speed = float(raw_avg_speed) if raw_avg_speed is not None else None
                 session.max_speed = float(raw_max_speed) if raw_max_speed is not None else None
                 session.avg_cadence = float(getattr(msg, 'avg_cadence', 0) or 0)
                 session.max_cadence = getattr(msg, 'max_cadence', None)
                 sessions.append(session)
 
-            elif msg_type == "RecordMessage":
+            elif msg_global_id == FitToolRecordMessage.ID or msg_type == "RecordMessage":
                 rec = FitRecord()
                 raw_ts = getattr(msg, 'timestamp', None)
                 rec.timestamp = FitParserService._ms_to_datetime(raw_ts)
@@ -130,10 +319,17 @@ class FitParserService:
                     rec.temperature = float(temp)
                     available_fields.add("temperature")
 
+                grad = getattr(msg, 'gradient', None)
+                if grad is None:
+                    grad = getattr(msg, 'grade', None)
+                if grad is not None:
+                    rec.gradient = float(grad)
+                    available_fields.add("gradient")
+
                 if rec.timestamp is not None:
                     records.append(rec)
 
-            elif msg_type == "LapMessage":
+            elif msg_global_id == FitToolLapMessage.ID or msg_type == "LapMessage":
                 raw_ts = getattr(msg, 'timestamp', None)
                 dt = FitParserService._ms_to_datetime(raw_ts)
                 if dt:
@@ -179,7 +375,102 @@ class FitParserService:
                     available_fields.add("distance")
                     fit_data.available_fields = sorted(available_fields)
 
+            if FitParserService._compute_gradients(records):
+                available_fields.add("gradient")
+                fit_data.available_fields = sorted(available_fields)
+
         return fit_data
+
+    @staticmethod
+    def _compute_gradients(records: list[FitRecord]) -> bool:
+        """为记录预计算平滑坡度，减少渲染期重复计算与静止抖动。"""
+        if not records:
+            return False
+
+        raw_values = []
+        has_any = False
+        for i, rec in enumerate(records):
+            raw = rec.gradient
+            if raw is None:
+                raw = FitParserService._estimate_gradient(records, i)
+            if raw is not None:
+                has_any = True
+            raw_values.append(raw)
+
+        if not has_any:
+            return False
+
+        stable_values = []
+        last_stable = 0.0
+        for rec, raw in zip(records, raw_values):
+            is_stopped = (
+                rec.speed is not None and
+                rec.speed <= FitParserService._GRADIENT_STOP_SPEED_MS
+            )
+            if raw is None or is_stopped:
+                stable = last_stable
+            else:
+                stable = raw
+                last_stable = raw
+            stable_values.append(stable)
+
+        smoothed = stable_values[:]
+        radius = FitParserService._GRADIENT_SMOOTH_RADIUS
+        for i, rec in enumerate(records):
+            if rec.speed is not None and rec.speed <= FitParserService._GRADIENT_STOP_SPEED_MS:
+                continue
+            start = max(0, i - radius)
+            end = min(len(stable_values), i + radius + 1)
+            window = [v for v in stable_values[start:end] if v is not None]
+            if window:
+                window.sort()
+                smoothed[i] = window[len(window) // 2]
+
+        last_stable = 0.0
+        for i, rec in enumerate(records):
+            value = smoothed[i]
+            if rec.speed is not None and rec.speed <= FitParserService._GRADIENT_STOP_SPEED_MS:
+                rec.gradient = last_stable
+            else:
+                rec.gradient = value
+                last_stable = value
+
+        return True
+
+    @staticmethod
+    def _estimate_gradient(records: list[FitRecord], center_idx: int) -> Optional[float]:
+        """用 altitude / distance 差估算单点坡度。"""
+        center = records[center_idx]
+        if center.altitude is None or center.distance is None:
+            return None
+
+        half_window = FitParserService._GRADIENT_WINDOW_M / 2.0
+
+        left = center_idx
+        while left > 0:
+            if records[left].distance is not None and center.distance - records[left].distance >= half_window:
+                break
+            left -= 1
+
+        right = center_idx
+        while right < len(records) - 1:
+            if records[right].distance is not None and records[right].distance - center.distance >= half_window:
+                break
+            right += 1
+
+        r1 = records[left]
+        r2 = records[right]
+        if r1.altitude is None or r2.altitude is None:
+            return None
+        if r1.distance is None or r2.distance is None:
+            return None
+
+        dist_diff = r2.distance - r1.distance
+        if dist_diff < FitParserService._GRADIENT_MIN_DISTANCE_M:
+            return None
+
+        gradient = ((r2.altitude - r1.altitude) / dist_diff) * 100.0
+        return max(-99.9, min(99.9, gradient))
 
     @staticmethod
     def get_record_at(fit_data: FitData, target_time: datetime) -> Optional[FitRecord]:
@@ -210,7 +501,8 @@ class FitParserService:
         ratio = (target_time - r1.timestamp).total_seconds() / (r2.timestamp - r1.timestamp).total_seconds()
         result = FitRecord(timestamp=target_time)
         for field_name in ("latitude", "longitude", "altitude", "speed",
-                           "distance", "heart_rate", "cadence", "power", "temperature"):
+                           "distance", "heart_rate", "cadence", "power",
+                           "temperature", "gradient"):
             v1, v2 = getattr(r1, field_name), getattr(r2, field_name)
             if v1 is not None and v2 is not None:
                 setattr(result, field_name, v1 + (v2 - v1) * ratio)

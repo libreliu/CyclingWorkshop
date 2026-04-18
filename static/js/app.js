@@ -37,6 +37,11 @@ const App = {
     originalGeoJson: null,
     originalTrackLayer: null,
     isFiltered: false,
+    globalStyle: {
+      bg_color: "#00000028",        // #RRGGBBAA，默认黑色 10% alpha
+      label_unit_shadow: true,     // 标签/单位文字阴影
+      text_shadow_alpha: 180,      // 文字阴影不透明度 0-255
+    },
   },
 
   // ── 初始化 ────────────────────────────
@@ -1078,6 +1083,7 @@ const App = {
   async initStep4() {
     await this.loadTemplates();
     this.initCanvas();
+    this.syncGlobalStyleControls();
     if (this.state.videoInfo) {
       document.getElementById("overlayTimeSlider").max = this.state.videoInfo.duration;
       document.getElementById("overlayTimeSlider").step = 1 / (this.state.videoInfo.fps || 29.97);
@@ -1142,6 +1148,7 @@ const App = {
           include_background: !!(this.state.videoId),
           canvas_width: videoInfo.width || 1920,
           canvas_height: videoInfo.height || 1080,
+          global_style: this.state.globalStyle,
         }),
       });
 
@@ -1509,6 +1516,31 @@ const App = {
         <div class="edit-grid"><label>最小值: <input type="number" id="we_minVal" value="${w.style.min_val || 0}"></label><label>最大值: <input type="number" id="we_maxVal" value="${w.style.max_val || 100}"></label></div>
       `;
     }
+    if (w.widget_type === "HeartRateGauge") {
+      const hrZoneOn = w.style.hr_zone_color === true;
+      const hrMaxAge = w.style.hr_max_age || 30;
+      const hrMaxVal = w.style.hr_max || '';
+      html += `
+        <hr style="margin:6px 0; border-color:#444">
+        <label style="display:flex;align-items:center;gap:6px;">
+          <input type="checkbox" id="we_hrZoneColor" ${hrZoneOn ? 'checked' : ''}>
+          <span>按心率区间着色</span>
+        </label>
+        <div id="we_hrZoneSettings" style="display:${hrZoneOn ? 'block' : 'none'}; margin-top:6px;">
+          <div class="edit-grid">
+            <label>年龄 <small class="text-muted">(最大心率=220-年龄)</small>: <input type="number" id="we_hrMaxAge" value="${hrMaxAge}" min="10" max="90" step="1"></label>
+            <label>最大心率 <small class="text-muted">(留空则按年龄)</small>: <input type="number" id="we_hrMax" value="${hrMaxVal}" min="100" max="250" step="1" placeholder="如 185"></label>
+          </div>
+          <div style="margin-top:6px; font-size:12px; line-height:1.8; opacity:0.85;">
+            <span style="color:#4488ff">■</span> Z1 50–60%&emsp;
+            <span style="color:#44cc44">■</span> Z2 60–70%&emsp;
+            <span style="color:#ffdd00">■</span> Z3 70–80%&emsp;
+            <span style="color:#ff8800">■</span> Z4 80–90%&emsp;
+            <span style="color:#ff3333">■</span> Z5 90–100%
+          </div>
+        </div>
+      `;
+    }
     if (w.widget_type === "MapTrack") {
       html += `
         <label>轨迹颜色: <input type="color" id="we_trackColor" value="${(w.style.track_color || '#00d4aa').slice(0,7)}"></label>
@@ -1589,7 +1621,6 @@ const App = {
         <label>单位偏移X: <input type="number" id="we_unitOffsetX" value="${w.style.unit_offset_x || 0}" step="5"> <small class="text-muted">px</small></label>
         <label>单位偏移Y: <input type="number" id="we_unitOffsetY" value="${w.style.unit_offset_y || 0}" step="2"> <small class="text-muted">px</small></label>
         <label>标签偏移X: <input type="number" id="we_labelOffsetX" value="${w.style.label_offset_x || 0}" step="5"> <small class="text-muted">px</small></label>
-        <label>窗口秒数: <input type="number" id="we_gradientWindow" value="${w.style.gradient_window || 5}" min="1" max="30"> <small class="text-muted">前后取N秒海拔计算</small></label>
       `;
     }
     if (w.widget_type === "AltitudeChart") {
@@ -1619,6 +1650,14 @@ const App = {
           if (tzSelect.value === "__custom__") tzCustom.focus();
         });
       }
+    }
+    // 心率区间颜色开关
+    const hrZoneCb = document.getElementById("we_hrZoneColor");
+    if (hrZoneCb) {
+      hrZoneCb.addEventListener("change", () => {
+        const settings = document.getElementById("we_hrZoneSettings");
+        if (settings) settings.style.display = hrZoneCb.checked ? "block" : "none";
+      });
     }
   },
 
@@ -1692,8 +1731,6 @@ const App = {
     if (labelOffsetXEl) w.style.label_offset_x = parseInt(labelOffsetXEl.value) || 0;
     const labelOffsetYEl = document.getElementById("we_labelOffsetY");
     if (labelOffsetYEl) w.style.label_offset_y = parseInt(labelOffsetYEl.value) || 0;
-    const gradientWindowEl = document.getElementById("we_gradientWindow");
-    if (gradientWindowEl) w.style.gradient_window = parseInt(gradientWindowEl.value) || 5;
     const textAlignEl = document.getElementById("we_textAlign");
     if (textAlignEl) w.style.text_align = textAlignEl.value;
     const autoAspectEl = document.getElementById("we_autoAspect");
@@ -1723,6 +1760,12 @@ const App = {
     if (followWindowEl) w.style.follow_window = parseInt(followWindowEl.value) || 120;
     const distanceModeEl = document.getElementById("we_distanceMode");
     if (distanceModeEl) w.style.distance_mode = distanceModeEl.value;
+    const hrZoneCbSave = document.getElementById("we_hrZoneColor");
+    if (hrZoneCbSave) w.style.hr_zone_color = hrZoneCbSave.checked;
+    const hrMaxAgeEl = document.getElementById("we_hrMaxAge");
+    if (hrMaxAgeEl) w.style.hr_max_age = parseInt(hrMaxAgeEl.value) || 30;
+    const hrMaxEl = document.getElementById("we_hrMax");
+    if (hrMaxEl) w.style.hr_max = hrMaxEl.value ? parseInt(hrMaxEl.value) : null;
 
     // MapTrack 概览模式自动宽高比
     if (w.widget_type === "MapTrack" && w.style.auto_aspect && this.state.fitId && (w.style.map_mode || "overview") === "overview") {
@@ -1787,6 +1830,44 @@ const App = {
     this.renderWidgetList();
     this.renderWidgetOverlay();
     this.requestPreview(parseFloat(document.getElementById("overlayTimeSlider").value));
+  },
+
+  updateGlobalBgColor() {
+    // 颜色选择器 + alpha 滑块组合 → #RRGGBBAA 格式
+    const hex = document.getElementById("globalBgColor")?.value || "#000000";
+    const alpha = parseInt(document.getElementById("globalBgAlpha")?.value, 10);
+    const aa = alpha.toString(16).padStart(2, "0");
+    this.state.globalStyle.bg_color = hex + aa;
+    // 实时更新预览
+    this.requestPreview(parseFloat(document.getElementById("overlayTimeSlider").value));
+  },
+
+  setGlobalLabelShadow(enabled) {
+    this.state.globalStyle.label_unit_shadow = !!enabled;
+    this.requestPreview(parseFloat(document.getElementById("overlayTimeSlider").value));
+  },
+
+  setGlobalTextShadowAlpha(value) {
+    this.state.globalStyle.text_shadow_alpha = Math.max(0, Math.min(255, parseInt(value, 10) || 0));
+    this.requestPreview(parseFloat(document.getElementById("overlayTimeSlider").value));
+  },
+
+  syncGlobalStyleControls() {
+    const bg = this.state.globalStyle?.bg_color || "#00000028";
+    const match = /^#([0-9a-fA-F]{6})([0-9a-fA-F]{2})?$/.exec(bg);
+    const color = match ? `#${match[1]}` : "#000000";
+    const alpha = match && match[2] ? parseInt(match[2], 16) : 40;
+    const textShadowAlpha = this.state.globalStyle?.text_shadow_alpha ?? 180;
+
+    const colorInput = document.getElementById("globalBgColor");
+    const alphaInput = document.getElementById("globalBgAlpha");
+    const shadowInput = document.getElementById("globalLabelShadow");
+    const textShadowInput = document.getElementById("globalTextShadowAlpha");
+
+    if (colorInput) colorInput.value = color;
+    if (alphaInput) alphaInput.value = String(alpha);
+    if (shadowInput) shadowInput.checked = this.state.globalStyle?.label_unit_shadow !== false;
+    if (textShadowInput) textShadowInput.value = String(textShadowAlpha);
   },
 
   // ── Step 5: 渲染导出 ──────────────────
@@ -2154,7 +2235,10 @@ const App = {
     const name = prompt("项目名称:", "新项目");
     if (!name) return;
     try {
-      const data = await API.createProject({ name, fit_path: this.state.fitId || "", video_path: this.state.videoId || "" });
+      const data = await API.createProject({
+        name,
+        ...this._collectProjectData(),
+      });
       this.state.projectId = data.id;
       document.getElementById("projectName").textContent = name;
       this.toast("项目已创建", "success");
@@ -2217,6 +2301,7 @@ const App = {
       video_path: this.state.videoId || "",
       overlay_template_name: this.state.templateName,
       widgets: this.state.widgets,
+      global_style: this.state.globalStyle,
       time_sync: this.getTimeSync(),
       render_settings: renderSettings,
       sanitize_config: sanitizeConfig,
@@ -2273,6 +2358,12 @@ const App = {
       this.state.projectId = data.id;
       this.state.widgets = data.widgets || [];
       this.state.templateName = data.overlay_template_name || "";
+      this.state.globalStyle = {
+        bg_color: "#00000028",
+        label_unit_shadow: true,
+        text_shadow_alpha: 180,
+        ...(data.global_style || {}),
+      };
       document.getElementById("projectName").textContent = data.name || "未命名项目";
 
       // 还原 FIT
@@ -2360,6 +2451,7 @@ const App = {
 
       // 跳到叠加设计步骤显示 widget
       this.goStep(4);
+      this.syncGlobalStyleControls();
 
       this.toast(`项目「${data.name}」已加载`, "success");
     } catch (e) { this.toast(`加载失败: ${e.message}`, "error"); }

@@ -39,6 +39,7 @@ def render_preview():
     include_background = body.get("include_background", True)
     canvas_width = body.get("canvas_width", 1920)
     canvas_height = body.get("canvas_height", 1080)
+    global_style = body.get("global_style")
 
     # 获取 FIT 数据
     fit_data = _fit_cache.get(fit_path)
@@ -61,6 +62,7 @@ def render_preview():
         widgets=widgets,
         canvas_width=canvas_width,
         canvas_height=canvas_height,
+        global_style=global_style,
     )
 
     # 如果需要视频背景，合成视频帧
@@ -169,6 +171,7 @@ def render_start():
     batch_size = render_settings.get("batch_size", 8)  # 每批并行帧数
     render_mode = render_settings.get("render_mode", "pipeline")  # 渲染模式: pipeline | tick
     max_ticks = render_settings.get("max_ticks", None)  # tick 模式最大轮数（None=无限）
+    global_style = body.get("global_style")  # 全局样式（bg_color, label_unit_shadow 等）
 
     # 创建任务
     task_id = uuid.uuid4().hex[:12]
@@ -202,6 +205,7 @@ def render_start():
             canvas_width, canvas_height, fps, render_start_sec, render_end_sec,
             output_path, codec, preset, crf, audio_mode, overlay_only, overlay_codec,
             hwaccel_decode, num_workers, batch_size, render_mode, max_ticks,
+            global_style,
         ),
         daemon=True,
     )
@@ -215,6 +219,7 @@ def _render_worker_v3(
     canvas_width, canvas_height, fps, start_sec, end_sec,
     output_path, codec, preset, crf, audio_mode, overlay_only, overlay_codec,
     hwaccel_decode, num_workers, batch_size, render_mode, max_ticks,
+    global_style,
 ):
     """后台渲染线程 — 使用 PyAV 渲染管线（多进程流水线 + 实时日志）"""
 
@@ -258,6 +263,7 @@ def _render_worker_v3(
         hwaccel_decode=hwaccel_decode,
         use_tick_mode=(render_mode == "tick"),
         max_ticks=max_ticks,
+        global_style=global_style,
     )
 
     task["status"] = result["status"]

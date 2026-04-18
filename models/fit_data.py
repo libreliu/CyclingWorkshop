@@ -17,13 +17,15 @@ class FitRecord:
     distance: Optional[float] = None    # m
     power: Optional[int] = None         # watts
     temperature: Optional[float] = None # ℃
+    gradient: Optional[float] = None    # %，解析阶段预计算/平滑后的坡度
 
     def to_dict(self) -> dict:
         d = {
             "timestamp": self.timestamp.isoformat() if self.timestamp else None,
         }
         for k in ("latitude", "longitude", "altitude", "heart_rate",
-                   "cadence", "speed", "distance", "power", "temperature"):
+                   "cadence", "speed", "distance", "power", "temperature",
+                   "gradient"):
             v = getattr(self, k)
             d[k] = v
         return d
@@ -45,6 +47,7 @@ class FitRecord:
             distance=d.get("distance"),
             power=d.get("power"),
             temperature=d.get("temperature"),
+            gradient=d.get("gradient"),
         )
 
     def get_field(self, name: str):

@@ -392,6 +392,17 @@
             <h3>全局设置</h3>
             <label>背景透明度: <input type="range" id="globalOpacity" min="0" max="1" step="0.05" value="1" oninput="App.setGlobalOpacity(this.value)"></label>
             <label>整体缩放: <input type="range" id="globalScale" min="50" max="200" value="100" step="5" oninput="App.setGlobalScale(this.value)">%</label>
+            <label title="所有 Widget 的统一背景色（含透明度）。各 Widget 可单独覆盖">
+              背景色: <input type="color" id="globalBgColor" value="#000000" oninput="App.updateGlobalBgColor()"> 
+              透明度: <input type="range" id="globalBgAlpha" min="0" max="255" value="40" step="5" oninput="App.updateGlobalBgColor()">
+            </label>
+            <label title="标签和单位文字是否绘制阴影（关闭后文字更清晰，适合高对比度背景）">
+              <input type="checkbox" id="globalLabelShadow" checked onchange="App.setGlobalLabelShadow(this.checked)">
+              标签/单位阴影
+            </label>
+            <label title="统一控制文字阴影不透明度。0 为无阴影，255 为最深">
+              阴影强度: <input type="range" id="globalTextShadowAlpha" min="0" max="255" value="180" step="5" oninput="App.setGlobalTextShadowAlpha(this.value)">
+            </label>
           </div>
         </div>
       </div>

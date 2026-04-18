@@ -113,6 +113,7 @@ class RenderPipeline:
         hwaccel_decode: bool = False,
         use_tick_mode: bool = False,
         max_ticks: Optional[int] = None,
+        global_style: Optional[dict] = None,
     ) -> dict:
         self._cancelled = False
         self.logs = []
@@ -194,6 +195,7 @@ class RenderPipeline:
                     overlay_codec=overlay_codec,
                     max_ticks=max_ticks,
                     hwaccel_decode=hwaccel_decode,
+                    global_style=global_style,
                 )
                 # tick_mode 返回的 result 直接透传
                 return actual_output
@@ -204,6 +206,7 @@ class RenderPipeline:
                 start_sec, end_sec, output_path, codec, preset, crf,
                 audio_mode, overlay_only, overlay_codec,
                 num_workers, start_time, progress_callback,
+                global_style=global_style,
                 rotation=video_info.rotation if video_info else 0,
                 hwaccel_decode=hwaccel_decode,
             )
@@ -249,6 +252,7 @@ class RenderPipeline:
         start_sec, end_sec, output_path, codec, preset, crf,
         audio_mode, overlay_only, overlay_codec,
         num_workers, start_time, progress_callback,
+        global_style: Optional[dict] = None,
         rotation=0, hwaccel_decode=False,
     ):
         """多进程流水线：Decode → Overlay → Encode
@@ -292,6 +296,9 @@ class RenderPipeline:
 
         # ── 序列化 fit_data / widgets / record_lookup ──
         fit_data_dict = fit_data.to_dict(include_records=True)
+        # 注入全局样式到 fit_data_dict（OverlayService 从中读取）
+        if global_style:
+            fit_data_dict["global_style"] = global_style
         widgets_dicts = [w.to_dict() for w in widgets]
         record_lookup_dicts = [
             r.to_dict() if r is not None else None for r in record_lookup
@@ -576,6 +583,7 @@ class RenderPipeline:
         overlay_codec: str = "qtrle",
         max_ticks: Optional[int] = None,
         hwaccel_decode: bool = False,
+        global_style: Optional[dict] = None,
     ) -> dict:
         """主线程 Tick 模式渲染：逐步调用每个 service 的 tick()
 
@@ -629,6 +637,8 @@ class RenderPipeline:
 
         # 序列化
         fit_data_dict = fit_data.to_dict(include_records=True)
+        if global_style:
+            fit_data_dict["global_style"] = global_style
         widgets_dicts = [w.to_dict() for w in widgets]
         record_lookup_dicts = [r.to_dict() if r is not None else None for r in record_lookup]
         fit_time_lookup_serialized = []

@@ -83,6 +83,7 @@ class SharedFrameBuffer:
         self.n_slots = n_slots
         self.frame_size = width * height * channels
         self.slot_bytes = self.frame_size * np.dtype(np.uint8).itemsize
+        self._is_creator = name is None
 
         # 总大小：states 数组 + frames 数据
         self.states_size = n_slots * np.dtype(np.int32).itemsize
@@ -95,19 +96,16 @@ class SharedFrameBuffer:
         else:
             # 消费者：连接已有共享内存
             self._shm = shm_module.SharedMemory(name=name)
+        self._shm_name = self._shm.name
 
-        # 映射 states 数组
+        # 只保留一份底层 buffer 引用，并使用 offset 创建 ndarray，
+        # 避免长期持有多个 memoryview slice，降低 close() 时的 exported
+        # pointers 概率。
+        self._buffer = self._shm.buf
         self._states = np.ndarray(
             (n_slots,), dtype=np.int32,
-            buffer=self._shm.buf[:self.states_size]
+            buffer=self._buffer, offset=0
         )
-
-        # 映射 frames 数组（保持对 buf 的引用，close 时需释放）
-        self._shm_buf = self._shm.buf
-        self._frames_buf = self._shm_buf[self.states_size:]
-
-        # 缓存 frame views（延迟创建，避免引用问题）
-        self._frame_views = [None] * n_slots
 
         if name is None:
             # 初始化所有状态为 EMPTY
@@ -127,7 +125,8 @@ class SharedFrameBuffer:
         return np.ndarray(
             (self.height, self.width, self.channels),
             dtype=np.uint8,
-            buffer=self._frames_buf[offset:offset + self.slot_bytes]
+            buffer=self._buffer,
+            offset=self.states_size + offset
         )
 
     def get_state(self, slot_idx: int) -> int:
@@ -161,20 +160,21 @@ class SharedFrameBuffer:
 
     def close(self):
         """关闭共享内存（不删除）。必须先释放所有 numpy view 引用。"""
-        # 释放 numpy views
-        self._frame_views = [None] * self.n_slots
-        self._frames_buf = None
-        self._shm_buf = None
+        # 先释放本对象持有的 ndarray / memoryview 引用，再关闭底层 SharedMemory。
+        self._states = None
+        self._buffer = None
         try:
             self._shm.close()
-        except BufferError:
-            pass  # 忽略仍有引用的情况
+        except FileNotFoundError:
+            pass
 
     def unlink(self):
         """删除共享内存（仅创建者调用）"""
+        if not self._is_creator:
+            return
         try:
             self._shm.unlink()
-        except FileNotFoundError:
+        except (FileNotFoundError, AttributeError):
             pass
 
 
@@ -504,6 +504,9 @@ class OverlayService(StandaloneService):
         self.num_workers = num_workers
         self.overlay_progress = overlay_progress
 
+        # 全局样式（从渲染设置传入）
+        self.global_style = fit_data_dict.get("global_style", {})
+
         # 内部状态
         self._fit_data = None
         self._widgets = None
@@ -592,6 +595,7 @@ class OverlayService(StandaloneService):
             widgets=self._widgets,
             canvas_width=self.canvas_width,
             canvas_height=self.canvas_height,
+            global_style=self.global_style,
         )
 
         # ── 合成 ──
@@ -599,7 +603,8 @@ class OverlayService(StandaloneService):
             composite = overlay_img
         else:
             bg_view = bg_buf.get_frame_view(bg_slot_idx)
-            bg_img = Image.fromarray(bg_view, "RGBA")
+            # 先复制出独立数组，避免 PIL Image 间接持有 SharedMemory buffer。
+            bg_img = Image.fromarray(np.array(bg_view, copy=True), "RGBA")
             del bg_view  # 释放 numpy view
             bg_img.alpha_composite(overlay_img)
             composite = bg_img.convert("RGB")
@@ -855,9 +860,11 @@ class EncodeService(StandaloneService):
                 out_frame = out_frame.reformat(format=self._pix_fmt)
 
         del view  # 释放 numpy view
+        del arr
 
         for packet in self._v_out.encode(out_frame):
             self._container.mux(packet)
+        del out_frame
 
         # 释放输出帧槽
         self.out_buf.set_state(buf_slot_idx, SlotState.EMPTY)

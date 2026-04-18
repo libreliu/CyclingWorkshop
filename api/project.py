@@ -21,7 +21,22 @@ def create_project():
         name=body.get("name", "未命名项目"),
         fit_path=body.get("fit_path", ""),
         video_path=body.get("video_path", ""),
+        overlay_template_name=body.get("overlay_template_name", ""),
+        global_style=body.get("global_style", {}) or {},
+        render_settings=body.get("render_settings", {}) or {},
     )
+    if "widgets" in body:
+        from models.overlay_template import WidgetConfig
+        project.widgets = [WidgetConfig.from_dict(w) for w in body["widgets"]]
+    if "time_sync" in body:
+        from models.video_config import TimeSyncConfig
+        project.video_config.time_sync = TimeSyncConfig.from_dict(body["time_sync"])
+    if "sanitize_config" in body:
+        from models.fit_data import SanitizeConfig
+        project.sanitize_config = SanitizeConfig.from_dict(body["sanitize_config"])
+    if "smoothing_config" in body:
+        from models.fit_data import SmoothingConfig
+        project.smoothing_config = SmoothingConfig.from_dict(body["smoothing_config"])
     project.save(config.PROJECTS_DIR)
     return jsonify(project.to_dict()), 201
 
@@ -55,6 +70,8 @@ def update_project(project_id):
     if "widgets" in body:
         from models.overlay_template import WidgetConfig
         project.widgets = [WidgetConfig.from_dict(w) for w in body["widgets"]]
+    if "global_style" in body:
+        project.global_style = body["global_style"] or {}
     if "time_sync" in body:
         from models.video_config import TimeSyncConfig
         project.video_config.time_sync = TimeSyncConfig.from_dict(body["time_sync"])

@@ -23,6 +23,7 @@ class Project:
     video_config: Optional[VideoConfig] = None
     overlay_template_name: str = ""
     widgets: list = field(default_factory=list)  # list[WidgetConfig]
+    global_style: dict = field(default_factory=dict)
     render_settings: dict = field(default_factory=dict)
     sanitize_config: Optional[SanitizeConfig] = None
     smoothing_config: Optional[SmoothingConfig] = None
@@ -45,6 +46,7 @@ class Project:
             "video_config": self.video_config.to_dict() if self.video_config else None,
             "overlay_template_name": self.overlay_template_name,
             "widgets": [w.to_dict() for w in self.widgets],
+            "global_style": self.global_style,
             "render_settings": self.render_settings,
             "sanitize_config": self.sanitize_config.to_dict() if self.sanitize_config else None,
             "smoothing_config": self.smoothing_config.to_dict() if self.smoothing_config else None,
@@ -87,6 +89,7 @@ class Project:
             video_config=video_config,
             overlay_template_name=d.get("overlay_template_name", ""),
             widgets=widgets,
+            global_style=d.get("global_style", {}),
             render_settings=d.get("render_settings", {}),
             sanitize_config=sanitize_config,
             smoothing_config=smoothing_config,

@@ -100,7 +100,7 @@ def _cycling_industrial(w: int, h: int) -> list[WidgetConfig]:
                 "color": color, "font_size": font_size, "unit": unit,
                 "format": "number", "font_family": "industrial",
                 "layout": "stacked", "label": label,
-                "max_val": max_val, "bg_color": "#00000088",
+                "max_val": max_val,
                 "border_radius": 4,
                 "unit_offset_x": 150,
                 "unit_offset_y": -16,
@@ -112,7 +112,7 @@ def _cycling_industrial(w: int, h: int) -> list[WidgetConfig]:
     y += gauge_h + gap
     widgets.append(_industrial_gauge("SpeedGauge", "speed", "SPEED", "km/h", "#00d4aa", y, 80))
     y += gauge_h + gap
-    widgets.append(_industrial_gauge("HeartRateGauge", "heart_rate", "HEART RATE", "bpm", "#ff4444", y, 200))
+    widgets.append(_industrial_gauge("HeartRateGauge", "heart_rate", "HEART RATE", "bpm", "#4488ff", y, 200))
     y += gauge_h + gap
     widgets.append(_industrial_gauge("GradientIndicator", "gradient", "GRADE", "%", "#ffaa00", y, 200))
     y += gauge_h + gap
@@ -124,20 +124,9 @@ def _cycling_industrial(w: int, h: int) -> list[WidgetConfig]:
     y += gauge_h + gap
 
     # TimerDisplay: stacked industrial layout, TIME label, left-aligned
-    timer_widget = WidgetConfig(
-        widget_type="TimerDisplay", x=margin + x_extra_margin, y=y,
-        width=col_w - x_extra_margin, height=gauge_h,
-        data_field="time",
-        style={
-            "color": "#ffffff", "font_size": font_size,
-            "font_family": "industrial", "layout": "stacked",
-            "label": "TIME", "text_align": "left",
-            "time_mode": "clock", "timezone": "Asia/Shanghai",
-            "bg_color": "#00000088", "border_radius": 4,
-            "unit_offset_x": 0, "unit_offset_y": 0,
-            "label_offset_x": 0, "label_offset_y": 0,
-        },
-    )
+    timer_widget = _industrial_gauge("TimerDisplay", "time", "TIME", "", "#ffffff", y, 200)
+    timer_widget.style["time_mode"] = "clock"
+    timer_widget.style["timezone"] = "Asia/Shanghai"
     widgets.append(timer_widget)
 
     return widgets

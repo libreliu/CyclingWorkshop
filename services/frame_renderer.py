@@ -2,6 +2,7 @@
 from typing import Optional
 from PIL import Image, ImageDraw, ImageFont
 import math
+
 import numpy as np
 
 from models.fit_data import FitData, FitRecord
@@ -36,10 +37,20 @@ class FrameRenderer:
         widgets: list,
         canvas_width: int,
         canvas_height: int,
+        global_style: dict = None,
     ) -> Image.Image:
-        """渲染一帧叠加层，返回 RGBA Image"""
+        """渲染一帧叠加层，返回 RGBA Image
+
+        global_style: 可选的全局渲染设置 dict：
+          - bg_color (str): 所有 Widget 的统一背景色（含 alpha），如 "#00000066"
+                           覆盖各 widget.style["bg_color"]（若 widget 未单独设置则用此值）
+          - label_unit_shadow (bool): 标签/单位是否绘制文字阴影（默认 True）
+        """
         from services.fit_parser import FitParserService
         from datetime import datetime
+
+        # 解析全局样式（None 时使用空字典）
+        gstyle = global_style or {}
 
         # 查询当前 FIT 数据
         if isinstance(fit_time, (int, float)):
@@ -66,22 +77,29 @@ class FrameRenderer:
         for widget in widgets:
             if not widget.visible:
                 continue
-            FrameRenderer._render_widget(canvas, widget, record, fit_data, fit_time)
+            FrameRenderer._render_widget(canvas, widget, record, fit_data, fit_time,
+                                         global_style=gstyle)
 
         return canvas
 
     @staticmethod
     def _render_widget(canvas, widget: WidgetConfig, record: Optional[FitRecord],
-                       fit_data: FitData, fit_time):
-        """渲染单个 Widget"""
+                       fit_data: FitData, fit_time, global_style: dict = None):
+        """渲染单个 Widget
+
+        global_style: 全局样式设置（同 render_frame）
+        """
         wtype = widget.widget_type
+        gstyle = global_style or {}
 
         # 创建 Widget 区域
         region = Image.new("RGBA", (widget.width, widget.height), (0, 0, 0, 0))
         draw = ImageDraw.Draw(region)
 
-        # 半透明背景
-        bg_color = widget.style.get("bg_color", "#00000066")
+        # 半透明背景：优先 widget.style.bg_color，其次全局 global_bg_color，最后默认值
+        bg_color = widget.style.get("bg_color") or gstyle.get("bg_color")
+        if bg_color is None:
+            bg_color = "#00000066"
         bg_rgba = FrameRenderer._parse_color(bg_color, default=(0, 0, 0, 102))
         if bg_rgba[3] > 0:
             # 圆角背景
@@ -97,27 +115,36 @@ class FrameRenderer:
         # 根据 Widget 类型渲染
         if wtype == "SpeedGauge":
             FrameRenderer._render_gauge(draw, widget, record, "speed",
-                                        lambda v: v * 3.6 if v else 0)  # m/s → km/h
+                                        lambda v: v * 3.6 if v else 0,
+                                        global_style=gstyle)  # m/s → km/h
         elif wtype == "HeartRateGauge":
-            FrameRenderer._render_gauge(draw, widget, record, "heart_rate", lambda v: v)
+            FrameRenderer._render_heart_rate(draw, widget, record,
+                                             global_style=gstyle)
         elif wtype == "CadenceGauge":
-            FrameRenderer._render_gauge(draw, widget, record, "cadence", lambda v: v)
+            FrameRenderer._render_gauge(draw, widget, record, "cadence", lambda v: v,
+                                        global_style=gstyle)
         elif wtype == "PowerGauge":
-            FrameRenderer._render_gauge(draw, widget, record, "power", lambda v: v)
+            FrameRenderer._render_gauge(draw, widget, record, "power", lambda v: v,
+                                        global_style=gstyle)
         elif wtype == "ElevationGauge":
-            FrameRenderer._render_gauge(draw, widget, record, "altitude", lambda v: v)
+            FrameRenderer._render_gauge(draw, widget, record, "altitude", lambda v: v,
+                                        global_style=gstyle)
         elif wtype == "DistanceCounter":
-            FrameRenderer._render_distance(draw, widget, record, fit_data)
+            FrameRenderer._render_distance(draw, widget, record, fit_data,
+                                           global_style=gstyle)
         elif wtype == "TimerDisplay":
-            FrameRenderer._render_timer(draw, widget, record, fit_data, fit_time)
+            FrameRenderer._render_timer(draw, widget, record, fit_data, fit_time,
+                                        global_style=gstyle)
         elif wtype == "GradientIndicator":
-            FrameRenderer._render_gradient(draw, widget, record, fit_data, fit_time)
+            FrameRenderer._render_gradient(draw, widget, record, fit_data, fit_time,
+                                           global_style=gstyle)
         elif wtype == "AltitudeChart":
-            FrameRenderer._render_altitude_chart(draw, widget, record, fit_data, fit_time)
+            FrameRenderer._render_altitude_chart(draw, widget, record, fit_data, fit_time,
+                                                 global_style=gstyle)
         elif wtype == "MapTrack":
             FrameRenderer._render_map_track(draw, widget, record, fit_data, fit_time)
         elif wtype == "CustomLabel":
-            FrameRenderer._render_label(draw, widget)
+            FrameRenderer._render_label(draw, widget, global_style=gstyle)
 
         # 如果有瓦片底图，先合成底图再叠加轨迹
         if tile_bg is not None:
@@ -149,8 +176,137 @@ class FrameRenderer:
             region = region.crop((src_x, src_y, region.width, region.height))
         canvas.alpha_composite(region, (dst_x, dst_y))
 
+    # ── 心率区间颜色 ─────────────────────────────────────────────────────────────
+    #
+    # 经典 5 区间（基于最大心率百分比）：
+    #   Z1: 50%-60%  热身区      蓝色   #4488ff
+    #   Z2: 60%-70%  脂肪燃烧    绿色   #44cc44
+    #   Z3: 70%-80%  有氧训练    黄色   #ffdd00
+    #   Z4: 80%-90%  无氧阈值    橙色   #ff8800
+    #   Z5: 90%-100% 最大强度    红色   #ff3333
+    #
+    # 最大心率 = 220 - 年龄（经典公式）
+    # 如果心率低于 50% 最大心率（热身前），使用原始 style.color
+
+    _HR_ZONES = [
+        (0.50, 0.60, (68,  136, 255, 255)),   # Z1 蓝
+        (0.60, 0.70, (68,  204,  68, 255)),   # Z2 绿
+        (0.70, 0.80, (255, 221,   0, 255)),   # Z3 黄
+        (0.80, 0.90, (255, 136,   0, 255)),   # Z4 橙
+        (0.90, 1.00, (255,  51,  51, 255)),   # Z5 红
+    ]
+
     @staticmethod
-    def _render_gauge(draw, widget, record, field_name, transform=None):
+    def _hr_zone_color(hr: float, max_hr: float, fallback_color: tuple) -> tuple:
+        """根据心率值和最大心率返回区间颜色 RGBA。
+        低于 Z1 下限（50% max_hr）返回 fallback_color。
+        超过 Z5 上限（100% max_hr）返回 Z5 颜色。
+        """
+        ratio = hr / max_hr if max_hr > 0 else 0
+        if ratio >= 0.90:
+            return FrameRenderer._HR_ZONES[-1][2]
+        for lo, hi, color in FrameRenderer._HR_ZONES:
+            if lo <= ratio < hi:
+                return color
+        return fallback_color  # < 50%
+
+    @staticmethod
+    def _render_heart_rate(draw, widget, record, global_style: dict = None):
+        """渲染心率表盘。
+
+        当 style.hr_zone_color=True 时，根据心率区间动态更改颜色：
+          Z1 50-60% 最大心率 → 蓝色
+          Z2 60-70%          → 绿色
+          Z3 70-80%          → 黄色
+          Z4 80-90%          → 橙色
+          Z5 90-100%         → 红色
+
+        最大心率由 style.hr_max_age（年龄）计算：max_hr = 220 - age
+        也可直接用 style.hr_max 指定最大心率值（优先级高于年龄）
+
+        低于 Z1 下限（< 50% 最大心率）时使用 style.color 原色。
+        """
+        style = widget.style
+        hr_zone_color_enabled = style.get("hr_zone_color", False)
+
+        # 拿到原始颜色作为 fallback
+        original_color = FrameRenderer._parse_color(style.get("color", "#ff4444"), default=(255, 68, 68, 255))
+
+        if hr_zone_color_enabled and record:
+            hr_raw = getattr(record, "heart_rate", None)
+            if hr_raw is not None:
+                hr_val = float(hr_raw)
+                # 最大心率：直接值优先，否则从年龄计算
+                hr_max = style.get("hr_max", None)
+                if hr_max:
+                    max_hr = float(hr_max)
+                else:
+                    age = style.get("hr_max_age", 30)
+                    max_hr = 220 - float(age)
+                zone_color = FrameRenderer._hr_zone_color(hr_val, max_hr, original_color)
+                # 只传 value_color，标签/单位颜色保持不变（仍基于 style.color）
+                FrameRenderer._render_gauge(
+                    draw,
+                    widget,
+                    record,
+                    "heart_rate",
+                    lambda v: v,
+                    value_color=zone_color,
+                    global_style=global_style,
+                )
+                return
+
+        # 未启用区间颜色或无心率数据，走通用渲染
+        FrameRenderer._render_gauge(
+            draw,
+            widget,
+            record,
+            "heart_rate",
+            lambda v: v,
+            global_style=global_style,
+        )
+
+    # 各字段对应的"最大显示字符串"，用于稳定布局高度（避免单位乱飞）
+    # key: field_name，value: 无小数版最大字符串（decimals>0 时自动补点）
+    _FIELD_MAX_DISPLAY = {
+        "speed":      "999",    # km/h（transform 后 0–999）
+        "heart_rate": "999",    # bpm
+        "cadence":    "999",    # rpm
+        "power":      "9999",   # W
+        "altitude":   "9999",   # m（可能负值，但高度一致即可）
+        "distance":   "9999",   # km
+        "gradient":   "-99",    # %（带符号）
+    }
+
+    @staticmethod
+    def _anchor_text(field_name: str, decimals: int, style: dict) -> str:
+        """返回用于测量布局高度的"锚点字符串"。
+
+        优先用 style.max_val 或 style.max_display 生成，
+        否则按字段名取内置最大值字符串。
+        返回值与实际 text 格式一致（含小数点），
+        确保 textbbox 高度（th）在每帧保持不变，避免单位/标签乱飞。
+        """
+        # 用户显式指定最大显示值（数字）
+        explicit = style.get("max_display", None)
+        if explicit is None:
+            explicit = style.get("max_val", None)
+        if explicit is not None:
+            try:
+                v = float(explicit)
+                base = f"{v:.{decimals}f}" if decimals > 0 else str(int(v))
+                return base
+            except (TypeError, ValueError):
+                pass
+
+        base = FrameRenderer._FIELD_MAX_DISPLAY.get(field_name, "999")
+        if decimals > 0:
+            return base + "." + "0" * decimals
+        return base
+
+    @staticmethod
+    def _render_gauge(draw, widget, record, field_name, transform=None, value_color=None,
+                      global_style: dict = None):
         """渲染数值型表盘
 
         支持两种视觉模式：
@@ -161,6 +317,10 @@ class FrameRenderer:
         - 数值用 industrial 粗体
         - 标签/单位用 industrial 小号半透明
         - style.layout="stacked" 时：标签在上 → 数值居中 → 单位在下（纵向堆叠）
+
+        value_color: 可选，单独指定数值文字的颜色（RGBA tuple）。
+                     若指定，标签和单位仍使用 style.color 的派生色，只有数值使用此颜色。
+        global_style: 全局样式设置（label_unit_shadow 等）
         """
         value = None
         if record and field_name != "track":
@@ -169,7 +329,10 @@ class FrameRenderer:
                 value = transform(raw) if transform else raw
 
         style = widget.style
+        gstyle = global_style or {}
         color = FrameRenderer._parse_color(style.get("color", "#ffffff"), default=(255, 255, 255, 255))
+        # 数值文字颜色：若调用方传入 value_color 则单独使用，否则与整体 color 一致
+        text_color = value_color if value_color is not None else color
         font_size = style.get("font_size", 28)
         unit = style.get("unit", "")
         fmt = style.get("format", "number")  # "number" | "arc"
@@ -181,6 +344,10 @@ class FrameRenderer:
         label_offset_x = style.get("label_offset_x", 0)  # 标签水平偏移（px）
         label_offset_y = style.get("label_offset_y", 0)  # 标签垂直偏移（px）
 
+        # 全局标签/单位阴影设置
+        shadow_enabled = gstyle.get("label_unit_shadow", True)
+        shadow_alpha = FrameRenderer._shadow_alpha(gstyle)
+
         # 选择字体族
         value_font = FrameRenderer._get_font(font_size, font_family)
         label_font = FrameRenderer._get_font(max(font_size * 3 // 5, 12), font_family)
@@ -191,7 +358,13 @@ class FrameRenderer:
             decimals = style.get("decimals", 1 if isinstance(value, float) else 0)
             text = f"{value:.{decimals}f}" if decimals > 0 else str(int(value))
         else:
+            decimals = style.get("decimals", 0)
             text = "--"
+
+        # 锚点字符串：用于稳定布局高度，避免单位随数值位数变化而跳动
+        anchor_text = FrameRenderer._anchor_text(field_name, decimals, style)
+        anchor_bbox = draw.textbbox((0, 0), anchor_text, font=value_font)
+        anchor_th = anchor_bbox[3] - anchor_bbox[1]
 
         # ── 绘制圆弧表盘（如果 format=arc）──
         if fmt == "arc" and value is not None:
@@ -228,22 +401,22 @@ class FrameRenderer:
                 lw = lbbox[2] - lbbox[0]
                 lh = lbbox[3] - lbbox[1]
                 lx = _align(widget.width, lw, label_offset_x)
-                label_color = (color[0], color[1], color[2], 160)
-                draw.text((lx, y_cursor + label_offset_y), label, font=label_font, fill=label_color)
+                FrameRenderer._draw_label_text(draw, label,
+                    lx, y_cursor + label_offset_y,
+                    label_font, color, shadow_enabled, shadow_alpha)
                 y_cursor += lh + 2 + label_offset_y
 
             # 留点空隙
             y_cursor += 8
 
             # 数值（中间，尽可能大）
+            # tw 用实际文字宽度（保持水平对齐正确），th 用锚点高度（稳定单位 Y 位置）
             bbox = draw.textbbox((0, 0), text, font=value_font)
             tw = bbox[2] - bbox[0]
-            th = bbox[3] - bbox[1]
             x = _align(widget.width, tw)
-            # 数值阴影
-            draw.text((x + 1, y_cursor + 1), text, font=value_font, fill=(0, 0, 0, 180))
-            draw.text((x, y_cursor), text, font=value_font, fill=color)
-            y_cursor += th + 1
+            FrameRenderer._draw_text_with_shadow(draw, text, x, y_cursor,
+                value_font, text_color, shadow_enabled, shadow_alpha)
+            y_cursor += anchor_th + 1  # 用锚点高度推进，单位 Y 位置不随数字变化
 
             # 单位（底部）
             if unit:
@@ -251,31 +424,31 @@ class FrameRenderer:
                 uw = ubbox[2] - ubbox[0]
                 ux = _align(widget.width, uw, unit_offset_x)
                 uy = y_cursor + unit_offset_y
-                unit_color = (color[0], color[1], color[2], 140)
-                draw.text((ux, uy), unit, font=unit_font, fill=unit_color)
+                FrameRenderer._draw_unit_text(draw, unit, ux, uy,
+                    unit_font, color, shadow_enabled)
         else:
             # ── centered 布局（原默认布局）──
             bbox = draw.textbbox((0, 0), text, font=value_font)
             tw = bbox[2] - bbox[0]
-            th = bbox[3] - bbox[1]
             x = (widget.width - tw) // 2
-            y = (widget.height - th) // 2 - (5 if fmt == "arc" else 0)
+            # 用锚点高度定位垂直中心，使数值在固定区域内显示
+            y = (widget.height - anchor_th) // 2 - (5 if fmt == "arc" else 0)
 
-            # 投影
-            draw.text((x + 1, y + 1), text, font=value_font, fill=(0, 0, 0, 180))
-            draw.text((x, y), text, font=value_font, fill=color)
+            FrameRenderer._draw_text_with_shadow(draw, text, x, y,
+                value_font, text_color, shadow_enabled, shadow_alpha)
 
             # 单位
             if unit:
                 ubbox = draw.textbbox((0, 0), unit, font=unit_font)
                 uw = ubbox[2] - ubbox[0]
                 ux = (widget.width - uw) // 2 + unit_offset_x
-                uy = y + th + 2 + unit_offset_y
-                draw.text((ux, uy), unit, font=unit_font, fill=(color[0], color[1], color[2], 180))
+                uy = y + anchor_th + 2 + unit_offset_y  # 用锚点高度定位单位
+                FrameRenderer._draw_unit_text(draw, unit, ux, uy,
+                    unit_font, color, shadow_enabled, shadow_alpha)
 
 
     @staticmethod
-    def _render_distance(draw, widget, record, fit_data):
+    def _render_distance(draw, widget, record, fit_data, global_style: dict = None):
         """渲染距离表盘
 
         distance_mode:
@@ -283,6 +456,9 @@ class FrameRenderer:
           "current_total"        - 显示当前/总距离，如 "13.5 / 153.8"
         """
         style = widget.style
+        gstyle = global_style or {}
+        shadow_enabled = gstyle.get("label_unit_shadow", True)
+        shadow_alpha = FrameRenderer._shadow_alpha(gstyle)
         distance_mode = style.get("distance_mode", "current")  # "current" | "current_total"
 
         # 当前距离
@@ -333,6 +509,12 @@ class FrameRenderer:
             cur_text = f"{value:.{decimals}f}" if value is not None else "--"
             total_text = f"{total_km:.{decimals}f}"
 
+            # 锚点字符串：总距离是固定值，以总距离字符串作为大值字体的高度锚点
+            # 确保当前距离从 "--" 变成数字时布局不跳动
+            anchor_cur = FrameRenderer._anchor_text("distance", decimals, style)
+            anchor_bbox_cur = draw.textbbox((0, 0), anchor_cur, font=value_font)
+            anchor_th_cur = anchor_bbox_cur[3] - anchor_bbox_cur[1]
+
             def _align(avail_w, item_w, offset_x=0):
                 if text_align == "left":
                     return 5 + offset_x
@@ -349,20 +531,20 @@ class FrameRenderer:
                     lbbox = draw.textbbox((0, 0), label, font=label_font)
                     lw = lbbox[2] - lbbox[0]
                     lx = _align(widget.width, lw, label_offset_x)
-                    label_color = (color[0], color[1], color[2], 160)
-                    draw.text((lx, y_cursor + label_offset_y), label, font=label_font, fill=label_color)
+                    FrameRenderer._draw_label_text(draw, label,
+                        lx, y_cursor + label_offset_y,
+                        label_font, color, shadow_enabled, shadow_alpha)
                     lh = lbbox[3] - lbbox[1]
                     y_cursor += lh + 2 + label_offset_y
                 y_cursor += 8
 
-                # 当前距离（大号）
+                # 当前距离（大号）：tw 用实际宽度，th 用锚点高度
                 bbox = draw.textbbox((0, 0), cur_text, font=value_font)
                 tw = bbox[2] - bbox[0]
-                th = bbox[3] - bbox[1]
                 x = _align(widget.width, tw)
-                draw.text((x + 1, y_cursor + 1), cur_text, font=value_font, fill=(0, 0, 0, 180))
-                draw.text((x, y_cursor), cur_text, font=value_font, fill=color)
-                y_cursor += th + 1
+                FrameRenderer._draw_text_with_shadow(draw, cur_text, x, y_cursor,
+                    value_font, color, shadow_enabled, shadow_alpha)
+                y_cursor += anchor_th_cur + 1  # 用锚点高度推进
 
                 # / 总距离（小号半透明）
                 total_full = f"/ {total_text} {unit}"
@@ -370,13 +552,14 @@ class FrameRenderer:
                 ttw = tbbox[2] - tbbox[0]
                 tx = _align(widget.width, ttw, unit_offset_x)
                 ty = y_cursor + unit_offset_y
-                total_color = (color[0], color[1], color[2], 140)
-                draw.text((tx, ty), total_full, font=total_font, fill=total_color)
+                FrameRenderer._draw_unit_text(draw, total_full, tx, ty,
+                    total_font, color, shadow_enabled, shadow_alpha)
             else:
                 # ── centered 布局：当前距离 大号 + /总距离 小号 ──
                 bbox = draw.textbbox((0, 0), cur_text, font=value_font)
                 tw = bbox[2] - bbox[0]
-                th = bbox[3] - bbox[1]
+                # th 用锚点高度，单位行 Y 位置不随位数变化
+                th = anchor_th_cur
 
                 total_full = f"/ {total_text}"
                 tbbox = draw.textbbox((0, 0), total_full, font=total_font)
@@ -390,14 +573,14 @@ class FrameRenderer:
                 y = (widget.height - max(th, tth)) // 2
 
                 # 当前距离
-                draw.text((start_x + 1, y + 1), cur_text, font=value_font, fill=(0, 0, 0, 180))
-                draw.text((start_x, y), cur_text, font=value_font, fill=color)
+                FrameRenderer._draw_text_with_shadow(draw, cur_text, start_x, y,
+                    value_font, color, shadow_enabled, shadow_alpha)
 
                 # / 总距离
                 total_x = start_x + tw + gap_px
                 total_y = y + th - tth  # 底部对齐
-                total_color = (color[0], color[1], color[2], 160)
-                draw.text((total_x, total_y), total_full, font=total_font, fill=total_color)
+                FrameRenderer._draw_unit_text(draw, total_full, total_x, total_y,
+                    total_font, color, shadow_enabled, shadow_alpha)
 
                 # 单位
                 if unit:
@@ -406,14 +589,17 @@ class FrameRenderer:
                     uw = ubbox[2] - ubbox[0]
                     ux = (widget.width - uw) // 2 + unit_offset_x
                     uy = y + max(th, tth) + 2 + unit_offset_y
-                    draw.text((ux, uy), full_unit_text, font=unit_font, fill=(color[0], color[1], color[2], 180))
+                    FrameRenderer._draw_unit_text(draw, full_unit_text, ux, uy,
+                        unit_font, color, shadow_enabled, shadow_alpha)
         else:
             # ── 默认模式：只显示当前距离（走原来的 _render_gauge）──
             FrameRenderer._render_gauge(draw, widget, record, "distance",
-                                        lambda v: v / 1000)  # m → km
+                                        lambda v: v / 1000,
+                                        global_style=gstyle)  # m → km
 
     @staticmethod
-    def _render_timer(draw, widget, record, fit_data, fit_time):
+    def _render_timer(draw, widget, record, fit_data, fit_time,
+                      global_style: dict = None):
         """渲染运动时间
 
         time_mode:
@@ -432,6 +618,9 @@ class FrameRenderer:
             return
 
         style = widget.style
+        gstyle = global_style or {}
+        shadow_enabled = gstyle.get("label_unit_shadow", True)
+        shadow_alpha = FrameRenderer._shadow_alpha(gstyle)
         time_mode = style.get("time_mode", "elapsed")  # "elapsed" | "clock"
         font_family = style.get("font_family", "default")
         font_size = style.get("font_size", 24)
@@ -483,6 +672,12 @@ class FrameRenderer:
             else:
                 return (avail_w - item_w) // 2 + offset_x
 
+        # 锚点字符串：时间格式固定为 HH:MM:SS，用于稳定布局高度
+        # 超长（天数）格式仅在极端情况出现，不作为主锚点
+        anchor_time_str = "00:00:00"
+        anchor_bbox = draw.textbbox((0, 0), anchor_time_str, font=font)
+        anchor_th = anchor_bbox[3] - anchor_bbox[1]
+
         if layout == "stacked":
             # ── stacked 布局：标签(上) → 时间(中) → 单位(下) ──
             y_cursor = 4
@@ -493,20 +688,20 @@ class FrameRenderer:
                 lbbox = draw.textbbox((0, 0), label_text, font=label_font)
                 lw = lbbox[2] - lbbox[0]
                 lx = _align(widget.width, lw, label_offset_x)
-                label_color = (color[0], color[1], color[2], 160)
-                draw.text((lx, y_cursor + label_offset_y), label_text, font=label_font, fill=label_color)
+                FrameRenderer._draw_label_text(draw, label_text,
+                    lx, y_cursor + label_offset_y,
+                    label_font, color, shadow_enabled, shadow_alpha)
                 lh = lbbox[3] - lbbox[1]
                 y_cursor += lh + 2 + label_offset_y
 
             y_cursor += 8
-            # 时间（大号）
+            # 时间（大号）：tw 用实际宽度，th 用锚点高度
             bbox = draw.textbbox((0, 0), text, font=font)
             tw = bbox[2] - bbox[0]
-            th = bbox[3] - bbox[1]
             x = _align(widget.width, tw)
-            draw.text((x + 1, y_cursor + 1), text, font=font, fill=(0, 0, 0, 180))
-            draw.text((x, y_cursor), text, font=font, fill=color)
-            y_cursor += th + 1
+            FrameRenderer._draw_text_with_shadow(draw, text, x, y_cursor,
+                font, color, shadow_enabled, shadow_alpha)
+            y_cursor += anchor_th + 1  # 用锚点高度推进，单位 Y 稳定
 
             # 单位（小号半透明）
             if unit:
@@ -515,77 +710,31 @@ class FrameRenderer:
                 uw = ubbox[2] - ubbox[0]
                 ux = _align(widget.width, uw, unit_offset_x)
                 uy = y_cursor + unit_offset_y
-                unit_color = (color[0], color[1], color[2], 140)
-                draw.text((ux, uy), unit, font=unit_font, fill=unit_color)
+                FrameRenderer._draw_unit_text(draw, unit, ux, uy,
+                    unit_font, color, shadow_enabled, shadow_alpha)
         else:
             # ── centered 布局（默认）：居中显示时间 ──
             bbox = draw.textbbox((0, 0), text, font=font)
             tw = bbox[2] - bbox[0]
-            th = bbox[3] - bbox[1]
             x = _align(widget.width, tw)
-            y = (widget.height - th) // 2
-            draw.text((x + 1, y + 1), text, font=font, fill=(0, 0, 0, 180))
-            draw.text((x, y), text, font=font, fill=color)
+            y = (widget.height - anchor_th) // 2  # 用锚点高度垂直居中
+            FrameRenderer._draw_text_with_shadow(draw, text, x, y,
+                font, color, shadow_enabled, shadow_alpha)
 
     @staticmethod
-    def _render_gradient(draw, widget, record, fit_data, fit_time):
+    def _render_gradient(draw, widget, record, fit_data, fit_time,
+                         global_style: dict = None):
         """渲染坡度指示
 
-        坡度计算优先级：
-        1. 如果 record 有 gradient 属性（FIT 原始字段），直接使用
-        2. 前后各取 N 秒的 altitude + distance 计算坡度
-        3. 如果 distance 不可用，用 speed × 时间差估算距离
+        坡度直接使用 parse 阶段预计算/平滑后的 record.gradient。
 
         支持 stacked 布局的 text_align / unit_offset / label_offset，
         与 _render_gauge 对齐逻辑一致。
         """
-        from services.fit_parser import FitParserService
-        from datetime import timedelta
-
-        if not fit_time:
-            return
-
-        gradient = None
-
-        # ── 优先使用 FIT 原始 gradient 字段 ──
-        if record and hasattr(record, 'gradient') and record.gradient is not None:
-            gradient = record.gradient
-
-        # ── 从海拔差推算坡度 ──
-        if gradient is None:
-            window = widget.style.get("gradient_window", 5)  # 前后窗口秒数
-            t1 = fit_time - timedelta(seconds=window)
-            t2 = fit_time + timedelta(seconds=window)
-            r1 = FitParserService.get_record_at(fit_data, t1)
-            r2 = FitParserService.get_record_at(fit_data, t2)
-
-            if r1 and r2 and r1.altitude is not None and r2.altitude is not None:
-                alt_diff = r2.altitude - r1.altitude
-
-                # 优先用 distance 差计算
-                dist_diff = 0
-                if r1.distance is not None and r2.distance is not None:
-                    dist_diff = r2.distance - r1.distance
-
-                # fallback：用 speed × 时间差估算距离
-                if dist_diff <= 0:
-                    time_diff = (t2 - t1).total_seconds()
-                    speed = None
-                    if record and record.speed is not None:
-                        speed = record.speed
-                    elif r1.speed is not None:
-                        speed = r1.speed
-                    elif r2.speed is not None:
-                        speed = r2.speed
-                    if speed and speed > 0 and time_diff > 0:
-                        dist_diff = speed * time_diff
-
-                if dist_diff > 0:
-                    gradient = (alt_diff / dist_diff) * 100
-                else:
-                    gradient = 0
-            else:
-                gradient = 0
+        gstyle = global_style or {}
+        shadow_enabled = gstyle.get("label_unit_shadow", True)
+        shadow_alpha = FrameRenderer._shadow_alpha(gstyle)
+        gradient = record.gradient if record and record.gradient is not None else 0
 
         style = widget.style
         color = FrameRenderer._parse_color(style.get("color", "#ffaa00"), default=(255, 170, 0, 255))
@@ -597,9 +746,14 @@ class FrameRenderer:
         # 数值文本（不含单位）
         text = f"{gradient:+.{decimals}f}"
 
+        # 锚点字符串：带符号、最大宽度，用于稳定布局高度
+        # 坡度通常 ±99.9%，以 "-99.9..." 作为锚点（带负号宽度更大）
+        anchor_str = "-99" + ("." + "9" * decimals if decimals > 0 else "")
+        anchor_bbox = draw.textbbox((0, 0), anchor_str, font=font)
+        anchor_th = anchor_bbox[3] - anchor_bbox[1]
+
         bbox = draw.textbbox((0, 0), text, font=font)
         tw = bbox[2] - bbox[0]
-        th = bbox[3] - bbox[1]
 
         # 支持 stacked 布局
         layout = style.get("layout", "centered")
@@ -627,17 +781,18 @@ class FrameRenderer:
             lw = lbbox[2] - lbbox[0]
             lh = lbbox[3] - lbbox[1]
             lx = _align(widget.width, lw, label_offset_x)
-            draw.text((lx, y_cursor + label_offset_y), label, font=label_font,
-                      fill=(color[0], color[1], color[2], 160))
+            FrameRenderer._draw_label_text(draw, label,
+                lx, y_cursor + label_offset_y,
+                label_font, color, shadow_enabled, shadow_alpha)
             y_cursor += lh + 2 + label_offset_y
 
             y_cursor += 8
 
             # 数值（阴影 + 前景）
             vx = _align(widget.width, tw)
-            draw.text((vx + 1, y_cursor + 1), text, font=font, fill=(0, 0, 0, 180))
-            draw.text((vx, y_cursor), text, font=font, fill=color)
-            y_cursor += th + 1
+            FrameRenderer._draw_text_with_shadow(draw, text, vx, y_cursor,
+                font, color, shadow_enabled, shadow_alpha)
+            y_cursor += anchor_th + 1  # 用锚点高度推进，单位 Y 稳定
 
             # 单位
             if unit:
@@ -645,19 +800,22 @@ class FrameRenderer:
                 uw = ubbox[2] - ubbox[0]
                 ux = _align(widget.width, uw, unit_offset_x)
                 uy = y_cursor + unit_offset_y
-                draw.text((ux, uy), unit, font=unit_font,
-                          fill=(color[0], color[1], color[2], 140))
+                FrameRenderer._draw_unit_text(draw, unit, ux, uy,
+                    unit_font, color, shadow_enabled, shadow_alpha)
         else:
             # centered 布局：数值+单位拼接
             full_text = f"{text}{unit}"
             fbbox = draw.textbbox((0, 0), full_text, font=font)
             ftw = fbbox[2] - fbbox[0]
             fth = fbbox[3] - fbbox[1]
-            draw.text(((widget.width - ftw) // 2, (widget.height - fth) // 2),
-                      full_text, font=font, fill=color)
+            fx = (widget.width - ftw) // 2
+            fy = (widget.height - fth) // 2
+            FrameRenderer._draw_unit_text(draw, full_text, fx, fy,
+                font, color, shadow_enabled, shadow_alpha)
 
     @staticmethod
-    def _render_altitude_chart(draw, widget, record, fit_data, fit_time):
+    def _render_altitude_chart(draw, widget, record, fit_data, fit_time,
+                               global_style: dict = None):
         """渲染海拔剖面图
 
         chart_mode:
@@ -950,9 +1108,11 @@ class FrameRenderer:
                     zoom = compute_zoom_for_size(min_lat, max_lat, min_lon, max_lon,
                                                   widget.width, widget.height, padding=0.1)
 
-            # ── 放大渲染：用更大尺寸渲染底图，然后缩小 ──
-            render_w = int(widget.width / follow_scale)
-            render_h = int(widget.height / follow_scale)
+            # ── 放大渲染：用更小逻辑视口渲染底图，再放大回 widget 尺寸 ──
+            # 这相当于“放大镜”效果：显示更小的地理范围，但像素铺满整个 widget。
+            render_w, render_h, _, _ = FrameRenderer._tile_follow_render_metrics(
+                widget.width, widget.height, follow_scale
+            )
 
             tile_url = get_tile_url(tile_style)
             tile_map = render_tile_map(center_lat, center_lon, zoom,
@@ -1038,25 +1198,39 @@ class FrameRenderer:
                                                       widget.width, widget.height, padding=0.1)
 
                 # ── numpy 向量化 Web Mercator 投影 ──
-                # 在放大模式下：用放大后的逻辑尺寸计算投影，然后除以 scale
+                # 与底图保持同一套变换：
+                # 1. 在较小的逻辑视口(render_w/render_h)中定位像素
+                # 2. 再按 (widget / render) 放大回最终屏幕坐标
                 center_px_x, center_px_y = latlon_to_pixel(proj_center_lat, proj_center_lon, zoom)
-                logic_w = widget.width * follow_scale
-                logic_h = widget.height * follow_scale
-                half_w = logic_w / 2
-                half_h = logic_h / 2
+                render_w, render_h, scale_x, scale_y = FrameRenderer._tile_follow_render_metrics(
+                    widget.width, widget.height, follow_scale
+                )
+                half_w = render_w / 2.0
+                half_h = render_h / 2.0
 
                 n = 2.0 ** zoom
                 px_x = (lons + 180.0) / 360.0 * n * 256
                 lat_rad = np.radians(lats)
                 px_y = (1.0 - np.log(np.tan(lat_rad) + 1.0 / np.cos(lat_rad)) / np.pi) / 2.0 * n * 256
-                # 在放大逻辑空间中计算坐标，然后缩放回实际 Widget 尺寸
-                all_x = ((px_x - center_px_x + half_w) / follow_scale).astype(np.int32)
-                all_y = ((px_y - center_px_y + half_h) / follow_scale).astype(np.int32)
+                # 先映射到逻辑视口，再按与底图一致的缩放倍率放大到实际 widget 尺寸。
+                all_x, all_y = FrameRenderer._project_tile_pixels_to_widget(
+                    px_x, px_y,
+                    center_px_x, center_px_y,
+                    render_w, render_h,
+                    scale_x, scale_y,
+                )
 
                 # 投影单个坐标（用于当前位置标记等少量点）
                 def project_single(lat, lon):
                     sx, sy = latlon_to_pixel(lat, lon, zoom)
-                    return int((sx - center_px_x + half_w) / follow_scale), int((sy - center_px_y + half_h) / follow_scale)
+                    px_arr_x, px_arr_y = FrameRenderer._project_tile_pixels_to_widget(
+                        np.array([sx], dtype=np.float64),
+                        np.array([sy], dtype=np.float64),
+                        center_px_x, center_px_y,
+                        render_w, render_h,
+                        scale_x, scale_y,
+                    )
+                    return int(px_arr_x[0]), int(px_arr_y[0])
 
             except Exception:
                 tile_style = ""  # 回退到矢量模式
@@ -1120,6 +1294,44 @@ class FrameRenderer:
                          fill=marker_color)
 
     @staticmethod
+    def _tile_follow_render_metrics(widget_width: int, widget_height: int, follow_scale: float):
+        """计算跟随底图/轨迹共用的逻辑视口尺寸与回放大倍率。
+
+        follow_scale > 1 表示显示更小的地理范围，再放大回 widget 尺寸。
+        这样底图、轨迹、当前位置标记必须共用同一套 metrics，才能严格对齐。
+        """
+        follow_scale = max(1.0, min(float(follow_scale), 4.0))
+        render_w = max(1, int(round(widget_width / follow_scale)))
+        render_h = max(1, int(round(widget_height / follow_scale)))
+        scale_x = widget_width / render_w
+        scale_y = widget_height / render_h
+        return render_w, render_h, scale_x, scale_y
+
+    @staticmethod
+    def _project_tile_pixels_to_widget(
+        px_x,
+        px_y,
+        center_px_x: float,
+        center_px_y: float,
+        render_w: int,
+        render_h: int,
+        scale_x: float,
+        scale_y: float,
+    ):
+        """将 Web Mercator 像素坐标投影到 widget 坐标。
+
+        先在逻辑视口(render_w/render_h)中定位，再按 scale_x/scale_y
+        放大回最终 widget 尺寸。支持 numpy 数组输入。
+        """
+        half_w = render_w / 2.0
+        half_h = render_h / 2.0
+        logic_x = px_x - center_px_x + half_w
+        logic_y = px_y - center_px_y + half_h
+        out_x = np.rint(logic_x * scale_x).astype(np.int32)
+        out_y = np.rint(logic_y * scale_y).astype(np.int32)
+        return out_x, out_y
+
+    @staticmethod
     def _get_walked_points_vectorized(records, fit_time, all_x, all_y):
         """使用 bisect + numpy 切片获取已走路径点（替代逐点调用闭包）
 
@@ -1168,14 +1380,19 @@ class FrameRenderer:
         return walked_points, None
 
     @staticmethod
-    def _render_label(draw, widget):
+    def _render_label(draw, widget, global_style: dict = None):
         """渲染自定义标签"""
+        gstyle = global_style or {}
+        shadow_enabled = gstyle.get("label_unit_shadow", True)
+        shadow_alpha = FrameRenderer._shadow_alpha(gstyle)
         text = widget.style.get("text", "Label")
         color = FrameRenderer._parse_color(widget.style.get("color", "#ffffff"), default=(255, 255, 255, 255))
         font_size = widget.style.get("font_size", 16)
         font_family = widget.style.get("font_family", "default")
         font = FrameRenderer._get_font(font_size, font_family)
-        draw.text((5, 5), text, font=font, fill=color)
+        FrameRenderer._draw_text_with_shadow(draw, text, 5, 5,
+            font, color, shadow_enabled,
+            max(0, min(255, int(round(shadow_alpha * 0.78)))))
 
     # ── 工具方法 ──────────────────────────────────
 
@@ -1213,6 +1430,62 @@ class FrameRenderer:
 
         FrameRenderer._font_cache[key] = font
         return font
+
+    @staticmethod
+    def _draw_label_text(draw, text: str, x: int, y: int,
+                         font, color: tuple, shadow: bool = True, shadow_alpha: int = 180):
+        """绘制标签文字（统一风格：半透明，可选阴影）
+
+        Args:
+            draw: ImageDraw 对象
+            text: 标签文字
+            x, y: 绘制坐标
+            font: 字体
+            color: 主色 RGBA tuple（如 (255, 255, 255, 160)）
+            shadow: 是否绘制文字阴影
+        """
+        label_color = (color[0], color[1], color[2], min(color[3], 180))
+        label_shadow_alpha = max(0, min(255, int(round(shadow_alpha * 0.78))))
+        FrameRenderer._draw_text_with_shadow(draw, text, x, y,
+            font, label_color, shadow, label_shadow_alpha)
+
+    @staticmethod
+    def _draw_unit_text(draw, text: str, x: int, y: int,
+                        font, color: tuple, shadow: bool = True, shadow_alpha: int = 180):
+        """绘制单位文字（统一风格：更小半透明，可选阴影）
+
+        Args:
+            draw: ImageDraw 对象
+            text: 单位文字
+            x, y: 绘制坐标
+            font: 字体
+            color: 主色 RGBA tuple（如 (255, 255, 255, 140)）
+            shadow: 是否绘制文字阴影
+        """
+        unit_color = (color[0], color[1], color[2], min(color[3], 160))
+        unit_shadow_alpha = max(0, min(255, int(round(shadow_alpha * 0.67))))
+        FrameRenderer._draw_text_with_shadow(draw, text, x, y,
+            font, unit_color, shadow, unit_shadow_alpha)
+
+    @staticmethod
+    def _shadow_alpha(global_style: dict = None, default: int = 180) -> int:
+        """读取并规范化全局文字阴影透明度。"""
+        gstyle = global_style or {}
+        raw = gstyle.get("text_shadow_alpha", default)
+        try:
+            alpha = int(raw)
+        except (TypeError, ValueError):
+            alpha = default
+        return max(0, min(255, alpha))
+
+    @staticmethod
+    def _draw_text_with_shadow(draw, text: str, x: int, y: int,
+                               font, color: tuple, shadow: bool = True,
+                               shadow_alpha: int = 180):
+        """统一绘制带阴影的文字。"""
+        if shadow and shadow_alpha > 0:
+            draw.text((x + 1, y + 1), text, font=font, fill=(0, 0, 0, shadow_alpha))
+        draw.text((x, y), text, font=font, fill=color)
 
     @staticmethod
     def _parse_color(color_str: str, default=(255, 255, 255, 255)) -> tuple:
