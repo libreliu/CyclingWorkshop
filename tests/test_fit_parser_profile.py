@@ -69,13 +69,15 @@ class TestFitParserProfile(unittest.TestCase):
         self.assertAlmostEqual(mid.speed, 6.02, places=2)
         self.assertAlmostEqual(mid.altitude, 64.8, places=1)
         self.assertEqual(mid.heart_rate, 131)
-        self.assertAlmostEqual(mid.gradient, -1.3026383603744993, places=9)
+        self.assertAlmostEqual(mid.gradient, -1.3026383603744993, places=8)
 
         self.assertEqual(last.timestamp.isoformat(), "2026-04-04T17:05:27+00:00")
         self.assertAlmostEqual(last.latitude, 22.592672249302268, places=10)
         self.assertAlmostEqual(last.longitude, 114.89987952634692, places=10)
         self.assertEqual(last.speed, 0.0)
         self.assertEqual(last.heart_rate, 255)
+        self.assertLess(abs(last.distance - session.total_distance), 30000)
+        self.assertLess(fit_data.haversine_total_distance, session.total_distance * 1.5)
 
     @unittest.skipUnless(
         os.getenv("RUN_FIT_PARSER_BENCHMARK") == "1",

@@ -25,10 +25,12 @@ def create_project():
         global_style=body.get("global_style", {}) or {},
         render_settings=body.get("render_settings", {}) or {},
     )
+    if "video_items" in body:
+        project.video_items = body.get("video_items", []) or []
     if "widgets" in body:
         from models.overlay_template import WidgetConfig
         project.widgets = [WidgetConfig.from_dict(w) for w in body["widgets"]]
-    if "time_sync" in body:
+    if "time_sync" in body and not project.video_items:
         from models.video_config import TimeSyncConfig
         project.video_config.time_sync = TimeSyncConfig.from_dict(body["time_sync"])
     if "sanitize_config" in body:
@@ -65,6 +67,10 @@ def update_project(project_id):
         project.fit_path = body["fit_path"]
     if "video_path" in body:
         project.video_path = body["video_path"]
+    if "video_items" in body:
+        project.video_items = body.get("video_items", []) or []
+        if project.video_items:
+            project.video_path = project.video_items[0].get("video_path", "")
     if "overlay_template_name" in body:
         project.overlay_template_name = body["overlay_template_name"]
     if "widgets" in body:
@@ -72,7 +78,7 @@ def update_project(project_id):
         project.widgets = [WidgetConfig.from_dict(w) for w in body["widgets"]]
     if "global_style" in body:
         project.global_style = body["global_style"] or {}
-    if "time_sync" in body:
+    if "time_sync" in body and not project.video_items:
         from models.video_config import TimeSyncConfig
         project.video_config.time_sync = TimeSyncConfig.from_dict(body["time_sync"])
     if "render_settings" in body:

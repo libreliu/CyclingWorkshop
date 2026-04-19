@@ -21,6 +21,7 @@ class Project:
     fit_path: str = ""
     video_path: str = ""
     video_config: Optional[VideoConfig] = None
+    video_items: list = field(default_factory=list)  # list[dict]
     overlay_template_name: str = ""
     widgets: list = field(default_factory=list)  # list[WidgetConfig]
     global_style: dict = field(default_factory=dict)
@@ -37,13 +38,16 @@ class Project:
             self.video_config = VideoConfig()
 
     def to_dict(self) -> dict:
+        video_items = self.video_items or self._legacy_video_items()
+        primary_video_path = video_items[0].get("video_path", "") if video_items else self.video_path
         return {
             "id": self.id,
             "name": self.name,
             "created_at": self.created_at,
             "fit_path": self.fit_path,
-            "video_path": self.video_path,
+            "video_path": primary_video_path,
             "video_config": self.video_config.to_dict() if self.video_config else None,
+            "video_items": video_items,
             "overlay_template_name": self.overlay_template_name,
             "widgets": [w.to_dict() for w in self.widgets],
             "global_style": self.global_style,
@@ -70,6 +74,17 @@ class Project:
 
         widgets = [WidgetConfig.from_dict(w) for w in d.get("widgets", [])]
 
+        video_items = d.get("video_items", []) or []
+        if not video_items and d.get("video_path"):
+            video_items = [{
+                "id": uuid.uuid4().hex[:12],
+                "video_path": d.get("video_path", ""),
+                "video_info": vc_data.get("video_info") if vc_data else None,
+                "time_sync": video_config.time_sync.to_dict() if video_config and video_config.time_sync else {},
+                "sync_mode": "auto",
+                "render_settings": {},
+            }]
+
         sanitize_config = None
         sc_data = d.get("sanitize_config")
         if sc_data:
@@ -87,6 +102,7 @@ class Project:
             fit_path=d.get("fit_path", ""),
             video_path=d.get("video_path", ""),
             video_config=video_config,
+            video_items=video_items,
             overlay_template_name=d.get("overlay_template_name", ""),
             widgets=widgets,
             global_style=d.get("global_style", {}),
@@ -94,6 +110,19 @@ class Project:
             sanitize_config=sanitize_config,
             smoothing_config=smoothing_config,
         )
+
+    def _legacy_video_items(self) -> list[dict]:
+        """将旧版单视频字段转换为 video_items 结构。"""
+        if not self.video_path:
+            return []
+        return [{
+            "id": self.id + "_video0",
+            "video_path": self.video_path,
+            "video_info": self.video_config.video_info.to_dict() if self.video_config and self.video_config.video_info else None,
+            "time_sync": self.video_config.time_sync.to_dict() if self.video_config and self.video_config.time_sync else {},
+            "sync_mode": "auto",
+            "render_settings": {},
+        }]
 
     def save(self, projects_dir: str):
         """保存到 YAML 文件"""
@@ -137,7 +166,8 @@ class Project:
                             "name": project.name,
                             "created_at": project.created_at,
                             "fit_path": project.fit_path,
-                            "video_path": project.video_path,
+                            "video_path": project.to_dict().get("video_path", ""),
+                            "video_count": len(project.to_dict().get("video_items", [])),
                             "widget_count": len(project.widgets),
                         })
                 except Exception:

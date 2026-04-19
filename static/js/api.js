@@ -131,6 +131,19 @@ const API = {
     return resp.json();
   },
 
+  async loadVideoBatch(paths) {
+    const resp = await fetch("/api/video/load_batch", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ paths }),
+    });
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({ error: "批量加载失败" }));
+      throw new Error(err.error || "批量加载视频失败");
+    }
+    return resp.json();
+  },
+
   async getVideoInfo(videoId) {
     const resp = await fetch(`/api/video/${encodeURIComponent(videoId)}/info`);
     if (!resp.ok) throw new Error("获取视频信息失败");
@@ -199,6 +212,18 @@ const API = {
   async getRenderResult(taskId) {
     const resp = await fetch(`/api/render/${taskId}/result`);
     if (!resp.ok) throw new Error("获取结果失败");
+    return resp.json();
+  },
+
+  async getRenderBatchStatus(batchId) {
+    const resp = await fetch(`/api/render/batch/${batchId}/status`);
+    if (!resp.ok) throw new Error("获取批量状态失败");
+    return resp.json();
+  },
+
+  async cancelRenderBatch(batchId) {
+    const resp = await fetch(`/api/render/batch/${batchId}/cancel`, { method: "POST" });
+    if (!resp.ok) throw new Error("取消批量任务失败");
     return resp.json();
   },
 

@@ -16,7 +16,7 @@
   <header id="topbar">
     <div class="logo">🚴 CyclingWorkshop</div>
     <div class="project-name" id="projectName">未命名项目</div>
-    <div class="topbar-actions">
+    <div class="topbar-actions" data-render-lock-group>
       <button onclick="App.newProject()" title="新建项目">新建</button>
       <button onclick="App.openProject()" title="打开项目">打开</button>
       <button onclick="App.saveProject()" title="保存项目">保存</button>
@@ -51,7 +51,7 @@
     <section id="step1" class="step-panel active">
       <div class="panel-grid">
         <!-- FIT 面板 -->
-        <div class="panel" id="fitPanel">
+        <div class="panel" id="fitPanel" data-render-lock-group>
           <div class="loading-overlay" id="fitLoadingOverlay" style="display:none;">
             <div class="spinner"></div>
             <div class="loading-text">正在解析 FIT 文件…</div>
@@ -93,19 +93,22 @@
         </div>
 
         <!-- 视频面板 -->
-        <div class="panel" id="videoPanel">
+        <div class="panel" id="videoPanel" data-render-lock-group>
           <div class="loading-overlay" id="videoLoadingOverlay" style="display:none;">
             <div class="spinner"></div>
             <div class="loading-text">正在分析视频文件…</div>
           </div>
           <h2>🎥 运动相机视频</h2>
+          <p class="text-muted" style="margin-top:-6px; margin-bottom:10px;">批量模式下可重复添加多个视频；同一工程内视频需保持相同分辨率。</p>
           <div class="path-input-group">
             <input type="text" id="videoPathInput" placeholder="输入视频文件本地路径，如 D:\DCIM\video.MP4" spellcheck="false">
             <button onclick="App.browseVideoFile()" class="btn-secondary" title="浏览文件">📁</button>
-            <button onclick="App.loadVideo()" class="btn-primary">加载</button>
+            <button onclick="App.loadVideo()" class="btn-primary">加载并加入</button>
           </div>
           <div id="videoStatus" class="status-msg"></div>
+          <div id="videoListContainer" class="batch-video-list"></div>
           <div id="videoSummary" class="summary-card" style="display:none;">
+            <div class="text-muted" id="selectedVideoLabel" style="margin-bottom:8px;"></div>
             <div class="video-thumb">
               <img id="videoThumb" alt="视频缩略图">
             </div>
@@ -294,61 +297,75 @@
     <section id="step3" class="step-panel">
       <div class="panel">
         <h2>⏱️ 时间同步</h2>
-        <div class="sync-info">
-          <div id="syncFitRange" class="sync-range">FIT 时间范围: --</div>
-          <div id="syncVideoRange" class="sync-range">视频时长: --</div>
-        </div>
-        <div class="sync-mode">
-          <label><input type="radio" name="syncMode" value="auto" checked onchange="App.setSyncMode('auto')"> 自动推断</label>
-          <label><input type="radio" name="syncMode" value="manual" onchange="App.setSyncMode('manual')"> 手动偏移</label>
-          <label><input type="radio" name="syncMode" value="keyframe" onchange="App.setSyncMode('keyframe')"> 关键帧对齐</label>
-        </div>
-        <div id="syncManual" class="sync-config" style="display:none;">
-          <div class="sync-field">
-            <label>🎬 视频录制起始时间:</label>
-            <input type="datetime-local" id="syncVideoStartTime" step="0.001" oninput="App._updateManualComputed()">
-            <span class="text-muted" id="syncVideoStartHint"></span>
+        <div class="sync-layout">
+          <div class="sync-video-sidebar">
+            <div class="sync-info">
+              <div id="syncFitRange" class="sync-range">FIT 时间范围: --</div>
+              <div id="syncVideoRange" class="sync-range">视频时长: --</div>
+            </div>
+            <div class="sync-batch-actions" data-render-lock-group>
+              <button onclick="App.autoSyncAllVideos()" class="btn-secondary">自动推断全部视频时间戳</button>
+              <button onclick="App.applyCurrentSyncToAll()" class="btn-secondary">应用当前倍率/偏移到全部视频</button>
+            </div>
+            <div id="syncVideoList" class="batch-video-list"></div>
           </div>
-          <div class="sync-field">
-            <label>⏱️ 微调偏移（秒）:</label>
-            <input type="number" id="syncManualOffset" value="0" step="0.001" style="width:100px;" oninput="App._updateManualComputed()">
-            <span class="text-muted">正值=FIT 时间延后（支持毫秒）</span>
-          </div>
-          <label>时间缩放: <input type="number" id="syncTimeScale" value="1" step="0.1" min="0.1">x</label>
-          <div class="sync-computed" id="syncManualComputed"></div>
-        </div>
-        <div id="syncAuto" class="sync-config">
-          <p>根据 FIT 文件起始时间和视频文件名/修改时间自动推断视频起始时间。</p>
-          <div id="syncAutoResult"></div>
-        </div>
-        <div id="syncKeyframe" class="sync-config" style="display:none;">
-          <p>在视频和轨迹上分别标记同一位置点，自动计算偏移。</p>
-          <table id="keyframeTable">
-            <thead><tr><th>#</th><th>视频时间(秒)</th><th>FIT 时间</th><th></th></tr></thead>
-            <tbody></tbody>
-          </table>
-          <button onclick="App.addKeyframe()" class="btn-secondary">添加关键帧</button>
-        </div>
-        <div class="sync-preview">
-          <h3>预览验证</h3>
-          <div class="preview-grid">
-            <div class="preview-video">
-              <div id="videoPreviewArea">
-                <img id="videoFramePreview" alt="视频帧预览">
+          <div class="sync-detail-main">
+            <div class="sync-detail-config" data-render-lock-group>
+              <div class="text-muted" id="syncSelectedVideoLabel" style="margin-bottom:8px;">当前视频: --</div>
+              <div class="sync-mode">
+              <label><input type="radio" name="syncMode" value="auto" checked onchange="App.setSyncMode('auto')"> 自动推断</label>
+              <label><input type="radio" name="syncMode" value="manual" onchange="App.setSyncMode('manual')"> 手动偏移</label>
+              <label><input type="radio" name="syncMode" value="keyframe" onchange="App.setSyncMode('keyframe')"> 关键帧对齐</label>
               </div>
-              <div class="time-slider">
-                <input type="range" id="videoTimeSlider" min="0" max="100" value="0" step="0.001" oninput="App.onVideoTimeChange(this.value)">
-                <span id="videoTimeLabel">00:00.000</span>
+              <div id="syncManual" class="sync-config" style="display:none;">
+                <div class="sync-field">
+                  <label>🎬 视频录制起始时间:</label>
+                  <input type="datetime-local" id="syncVideoStartTime" step="0.001" oninput="App._updateManualComputed()">
+                  <span class="text-muted" id="syncVideoStartHint"></span>
+                </div>
+                <div class="sync-field">
+                  <label>⏱️ 微调偏移（秒）:</label>
+                  <input type="number" id="syncManualOffset" value="0" step="0.001" style="width:100px;" oninput="App._updateManualComputed()">
+                  <span class="text-muted">正值=FIT 时间延后（支持毫秒）</span>
+                </div>
+                <label>时间缩放: <input type="number" id="syncTimeScale" value="1" step="0.1" min="0.1">x</label>
+                <div class="sync-computed" id="syncManualComputed"></div>
               </div>
-              <div class="frame-stepper">
-                <button onclick="App.stepVideoFrame(-1)" title="上一帧">⏪</button>
-                <button onclick="App.stepVideoFrame(1)" title="下一帧">⏩</button>
-                <span class="text-muted" id="videoFrameInfo"></span>
+              <div id="syncAuto" class="sync-config">
+                <p>根据 FIT 文件起始时间和视频文件名/修改时间自动推断视频起始时间。</p>
+                <div id="syncAutoResult"></div>
+              </div>
+              <div id="syncKeyframe" class="sync-config" style="display:none;">
+                <p>在视频和轨迹上分别标记同一位置点，自动计算偏移。</p>
+                <table id="keyframeTable">
+                  <thead><tr><th>#</th><th>视频时间(秒)</th><th>FIT 时间</th><th></th></tr></thead>
+                  <tbody></tbody>
+                </table>
+                <button onclick="App.addKeyframe()" class="btn-secondary">添加关键帧</button>
               </div>
             </div>
-            <div class="preview-track">
-              <div id="syncMap" style="height:300px;border-radius:8px;"></div>
-              <div id="syncFitTime">FIT: --</div>
+            <div class="sync-preview">
+              <h3>预览验证</h3>
+              <div class="preview-grid">
+                <div class="preview-video">
+                  <div id="videoPreviewArea">
+                    <img id="videoFramePreview" alt="视频帧预览">
+                  </div>
+                  <div class="time-slider">
+                    <input type="range" id="videoTimeSlider" min="0" max="100" value="0" step="0.001" oninput="App.onVideoTimeChange(this.value)">
+                    <span id="videoTimeLabel">00:00.000</span>
+                  </div>
+                  <div class="frame-stepper">
+                    <button onclick="App.stepVideoFrame(-1)" title="上一帧">⏪</button>
+                    <button onclick="App.stepVideoFrame(1)" title="下一帧">⏩</button>
+                    <span class="text-muted" id="videoFrameInfo"></span>
+                  </div>
+                </div>
+                <div class="preview-track">
+                  <div id="syncMap" style="height:300px;border-radius:8px;"></div>
+                  <div id="syncFitTime">FIT: --</div>
+                </div>
+              </div>
             </div>
           </div>
         </div>
@@ -377,7 +394,7 @@
             <span id="overlayTimeLabel">00:00.000</span>
           </div>
         </div>
-        <div class="design-panel">
+        <div class="design-panel" data-render-lock-group>
           <h2>📐 叠加层设计</h2>
           <label>模板:
             <select id="templateSelect" onchange="App.selectTemplate(this.value)">
@@ -416,8 +433,10 @@
     <section id="step5" class="step-panel">
       <div class="panel">
         <h2>🎬 渲染导出</h2>
-        <div class="render-settings">
+        <div class="render-settings" data-render-lock-group>
           <label>输出路径: <input type="text" id="outputPath" placeholder="输出视频路径" style="width:60%;" spellcheck="false"></label>
+          <div id="renderTargetList" class="batch-render-targets"></div>
+          <div class="text-muted" id="renderLockNotice" style="margin-top:10px; display:none;">渲染进行中：视频列表、时间对齐、叠加布局和导出参数已锁定，当前批次使用启动瞬间的配置快照。</div>
           <div class="render-row">
             <label>编码: <select id="renderCodec">
               <optgroup label="软件编码">
@@ -447,6 +466,9 @@
           <div class="render-row">
             <label title="使用 GPU 加速视频解码（实验性，可能不稳定）">
               <input type="checkbox" id="renderHwaccelDecode"> 硬件加速解码
+            </label>
+            <label title="同一批次最多同时运行多少个视频渲染任务。1 表示串行，2 及以上表示并发。">
+              批量并发数: <input type="number" id="renderBatchConcurrency" value="1" min="1" step="1" style="width:72px;">
             </label>
           </div>
           <div class="render-row" style="border:1px dashed #665500; border-radius:4px; padding:6px 10px; background:rgba(255,165,0,0.06);">
@@ -507,6 +529,7 @@
           <!-- 渲染实时日志 -->
           <div class="render-log-header" onclick="App._toggleRenderLog()">
             <span>📋 渲染日志</span>
+            <span id="renderLogTaskLabel" class="render-log-count">当前日志: --</span>
             <span id="renderLogCount" class="render-log-count">0 条</span>
             <span id="renderLogToggle" class="render-cmd-toggle">▼</span>
           </div>
@@ -521,10 +544,11 @@
             <div class="render-log-panel" id="renderLogPanel"></div>
           </div>
         </div>
+        <div id="renderBatchJobs" class="batch-render-jobs" style="display:none;"></div>
       </div>
       <div class="step-actions">
         <button onclick="App.goStep(4)" class="btn-secondary">← 上一步</button>
-        <button onclick="App.startRender()" class="btn-primary" id="startRenderBtn">▶ 开始渲染</button>
+        <button onclick="App.startRender()" class="btn-primary" id="startRenderBtn">▶ 开始批量渲染</button>
       </div>
     </section>
 

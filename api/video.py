@@ -25,6 +25,10 @@ def _get_or_analyze(path: str):
 def load_video():
     """通过本地路径加载视频"""
     body = request.get_json(silent=True) or {}
+    paths = body.get("paths")
+    if isinstance(paths, list):
+        return _load_video_batch(paths)
+
     path = body.get("path", "").strip().strip('"').strip("'")
 
     if not path:
@@ -39,6 +43,42 @@ def load_video():
     return jsonify({
         "id": path,
         "info": info.to_dict(),
+    })
+
+
+@video_bp.route("/load_batch", methods=["POST"])
+def load_video_batch():
+    """批量加载视频并返回分析结果。"""
+    body = request.get_json(silent=True) or {}
+    paths = body.get("paths", []) or []
+    return _load_video_batch(paths)
+
+
+def _load_video_batch(paths: list[str]):
+    items = []
+    errors = []
+    for raw_path in paths:
+        path = str(raw_path or "").strip().strip('"').strip("'")
+        if not path:
+            continue
+        if not os.path.isfile(path):
+            errors.append({"path": path, "error": f"文件不存在: {path}"})
+            continue
+        info = _get_or_analyze(path)
+        if info is None:
+            errors.append({"path": path, "error": f"视频分析失败: {path}"})
+            continue
+        items.append({
+            "id": path,
+            "info": info.to_dict(),
+        })
+
+    if not items and errors:
+        return jsonify({"error": errors[0]["error"], "errors": errors}), 400
+
+    return jsonify({
+        "items": items,
+        "errors": errors,
     })
 
 

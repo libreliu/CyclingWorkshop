@@ -9,6 +9,8 @@ const App = {
     fitData: null,
     videoId: null,
     videoInfo: null,
+    videoItems: [],
+    selectedVideoItemId: null,
     widgets: [],
     templateName: "",
     syncMode: "auto",
@@ -27,6 +29,11 @@ const App = {
     previewPlaying: false,
     previewTimer: null,
     renderTaskId: null,
+    renderActiveTaskId: null,
+    renderActiveTaskIds: [],
+    renderBatchId: null,
+    renderBatchJobs: [],
+    isRenderLocked: false,
     widgetTypes: [],
     tableData: [],
     tableFiltered: [],
@@ -58,6 +65,247 @@ const App = {
           e.target.value === "custom" ? "" : "none";
       });
     });
+  },
+
+  _normalizeVideoItem(item) {
+    const rawId = String(item.id || item.video_path || item.videoId || `video_${Date.now()}`);
+    const info = item.video_info || item.info || null;
+    return {
+      id: rawId.replace(/[^a-zA-Z0-9_-]/g, "_"),
+      video_path: item.video_path || item.path || item.id || "",
+      video_info: info,
+      time_sync: item.time_sync || {},
+      sync_mode: item.sync_mode || "auto",
+      keyframes: item.keyframes || [],
+      render_settings: item.render_settings || {},
+      sync_status: item.sync_status || "pending",
+    };
+  },
+
+  getSelectedVideoItem() {
+    const id = this.state.selectedVideoItemId;
+    return this.state.videoItems.find(v => v.id === id) || this.state.videoItems[0] || null;
+  },
+
+  _syncSelectedVideoToLegacyState() {
+    const item = this.getSelectedVideoItem();
+    this.state.selectedVideoItemId = item?.id || null;
+    this.state.videoId = item?.video_path || null;
+    this.state.videoInfo = item?.video_info || null;
+  },
+
+  _defaultOutputPathForVideo(path, overlayOnly = false, overlayCodec = "qtrle") {
+    const lower = path.toLowerCase();
+    const ext = overlayOnly ? (overlayCodec === "libvpx-vp9" ? ".webm" : ".mov") : ".mp4";
+    return lower.replace(/\.[^.]+$/, "") + "_overlay" + ext;
+  },
+
+  _ensureVideoItemRenderDefaults(item) {
+    if (!item.render_settings) item.render_settings = {};
+    if (!item.render_settings.output_path && item.video_path) {
+      const overlayOnly = document.getElementById("renderOverlayOnly")?.checked || false;
+      const overlayCodec = document.getElementById("renderOverlayCodec")?.value || "qtrle";
+      item.render_settings.output_path = this._defaultOutputPathForVideo(item.video_path, overlayOnly, overlayCodec);
+    }
+    return item;
+  },
+
+  _renderVideoItemStatusLabel(item) {
+    const status = item.sync_status || "pending";
+    return {
+      pending: "待设置",
+      auto: "已自动推断",
+      manual: "已手动调整",
+      keyframe: "关键帧模式",
+      ready: "已确认",
+      missing_time: "缺少时间戳",
+    }[status] || status;
+  },
+
+  _renderTaskStatusLabel(status) {
+    return {
+      queued: "排队中",
+      running: "渲染中",
+      completed: "已完成",
+      error: "失败",
+      cancelled: "已取消",
+      completed_with_errors: "部分失败",
+    }[status] || status;
+  },
+
+  _guardRenderLocked(message = "渲染进行中，当前工程关键配置已锁定") {
+    if (!this.state.isRenderLocked) return false;
+    this.toast(message, "info");
+    return true;
+  },
+
+  _setRenderLock(locked) {
+    this.state.isRenderLocked = !!locked;
+    document.body.classList.toggle("render-locked", !!locked);
+    document.querySelectorAll("[data-render-lock-group]").forEach(el => {
+      el.classList.toggle("render-locked-group", !!locked);
+    });
+    const notice = document.getElementById("renderLockNotice");
+    if (notice) notice.style.display = locked ? "" : "none";
+  },
+
+  _resetRenderLogView() {
+    this._stopLogPolling();
+    this._logPollIndex = 0;
+    this._logLineCount = 0;
+    const logPanel = document.getElementById("renderLogPanel");
+    if (logPanel) logPanel.innerHTML = "";
+    const cmdBody = document.getElementById("renderCmdBody");
+    const cmdContainer = document.getElementById("renderCmdContainer");
+    if (cmdBody) cmdBody.textContent = "";
+    if (cmdContainer) cmdContainer.style.display = "none";
+    this._updateLogCount();
+  },
+
+  _updateRenderLogTaskLabel() {
+    const label = document.getElementById("renderLogTaskLabel");
+    if (!label) return;
+    const job = (this.state.renderBatchJobs || []).find(item => item.task_id === this.state.renderTaskId);
+    label.textContent = job
+      ? `当前日志: ${job.display_name || job.video_path || job.task_id}`
+      : "当前日志: --";
+  },
+
+  selectRenderTask(taskId, options = {}) {
+    if (!taskId) return;
+    const changed = this.state.renderTaskId !== taskId;
+    this.state.renderTaskId = taskId;
+    this._updateRenderLogTaskLabel();
+    this.renderBatchJobs(this.state.renderBatchJobs || []);
+    document.getElementById("renderLogContainer").style.display = "";
+    if (!changed && !options.force) return;
+    this._resetRenderLogView();
+    this._startLogPolling();
+  },
+
+  renderVideoList() {
+    const containers = [
+      document.getElementById("videoListContainer"),
+      document.getElementById("syncVideoList"),
+    ].filter(Boolean);
+    const items = this.state.videoItems;
+    const html = !items.length
+      ? '<div class="text-muted">尚未加入视频。请在上方输入路径并加载。</div>'
+      : items.map(item => {
+          const info = item.video_info || {};
+          const selected = item.id === this.state.selectedVideoItemId;
+          return `
+            <div class="batch-video-item ${selected ? "is-selected" : ""}">
+              <div class="batch-video-item-header">
+                <button class="btn-link" onclick="App.selectVideoItem('${item.id}')" style="font-size:14px; text-align:left;">
+                  ${selected ? "▶ " : ""}${this._escapeHtml((item.video_path || "").split(/[\\\\/]/).pop() || item.id)}
+                </button>
+                <button class="btn-link" onclick="App.removeVideoItem('${item.id}')" title="移除">移除</button>
+              </div>
+              <div class="batch-video-item-meta">
+                <span>${info.width || "--"}×${info.height || "--"}</span>
+                <span>${info.duration ? this.formatDuration(info.duration) : "--"}</span>
+                <span>${info.fps ? `${Number(info.fps).toFixed(2)} fps` : "--"}</span>
+                <span>${this._renderVideoItemStatusLabel(item)}</span>
+              </div>
+            </div>
+          `;
+        }).join("");
+    containers.forEach(el => { el.innerHTML = html; });
+  },
+
+  renderRenderTargetList() {
+    const container = document.getElementById("renderTargetList");
+    if (!container) return;
+    if (!this.state.videoItems.length) {
+      container.innerHTML = '<div class="text-muted">暂无可渲染的视频。</div>';
+      return;
+    }
+    container.innerHTML = this.state.videoItems.map(item => {
+      this._ensureVideoItemRenderDefaults(item);
+      const info = item.video_info || {};
+      return `
+        <div class="batch-render-item">
+          <div class="batch-render-item-header">
+            <strong>${this._escapeHtml((item.video_path || "").split(/[\\\\/]/).pop() || item.id)}</strong>
+            <span class="text-muted">${info.width || "--"}×${info.height || "--"} · ${info.duration ? this.formatDuration(info.duration) : "--"}</span>
+          </div>
+          <input type="text" value="${this._escapeHtml(item.render_settings.output_path || "")}" onchange="App.updateVideoOutputPath('${item.id}', this.value)" spellcheck="false">
+        </div>
+      `;
+    }).join("");
+  },
+
+  renderBatchJobs(jobs = []) {
+    const container = document.getElementById("renderBatchJobs");
+    if (!container) return;
+    this.state.renderBatchJobs = jobs;
+    this._updateRenderLogTaskLabel();
+    if (!jobs.length) {
+      container.style.display = "none";
+      container.innerHTML = "";
+      return;
+    }
+    container.style.display = "";
+    container.innerHTML = jobs.map(job => {
+      const isSelected = job.task_id === this.state.renderTaskId;
+      const isActive = (this.state.renderActiveTaskId && job.task_id === this.state.renderActiveTaskId)
+        || (this.state.renderActiveTaskIds || []).includes(job.task_id);
+      return `
+      <div class="batch-render-item ${isSelected ? "is-selected" : ""} ${isActive ? "is-active" : ""}">
+        <div class="batch-render-item-header">
+          <strong>${this._escapeHtml(job.display_name || job.video_path || job.task_id)}</strong>
+          <span>${this._renderTaskStatusLabel(job.status)}</span>
+        </div>
+        <div class="batch-render-item-meta">
+          <span>${Number(job.progress || 0).toFixed(1)}%</span>
+          <span>${job.current_frame || 0}/${job.total_frames || 0} 帧</span>
+          <span>${job.output_path || ""}</span>
+          ${job.error ? `<span style="color:var(--danger)">${this._escapeHtml(job.error)}</span>` : ""}
+        </div>
+        <div class="batch-render-item-actions">
+          <button class="btn-secondary btn-sm" onclick="App.selectRenderTask('${job.task_id}')">${isSelected ? "查看中" : "查看日志"}</button>
+          ${isActive ? '<span class="text-muted">当前执行</span>' : ""}
+        </div>
+      </div>
+    `;
+    }).join("");
+  },
+
+  selectVideoItem(itemId, options = {}) {
+    if (!options.skipSave) this.saveCurrentSyncToSelectedVideo();
+    this.state.selectedVideoItemId = itemId;
+    this._syncSelectedVideoToLegacyState();
+    const item = this.getSelectedVideoItem();
+    if (item?.video_path) document.getElementById("videoPathInput").value = item.video_path;
+    if (item?.video_info) this.showVideoSummary(item.video_info);
+    this.renderVideoList();
+    this.renderRenderTargetList();
+    if (this.state.currentStep === 3) this.initStep3();
+    if (this.state.currentStep === 4) this.initStep4();
+    if (this.state.currentStep === 5) this.initStep5();
+  },
+
+  removeVideoItem(itemId) {
+    if (this._guardRenderLocked()) return;
+    this.saveCurrentSyncToSelectedVideo();
+    this.state.videoItems = this.state.videoItems.filter(v => v.id !== itemId);
+    if (this.state.selectedVideoItemId === itemId) {
+      this.state.selectedVideoItemId = this.state.videoItems[0]?.id || null;
+    }
+    this._syncSelectedVideoToLegacyState();
+    this.renderVideoList();
+    this.renderRenderTargetList();
+    if (this.state.videoInfo) this.showVideoSummary(this.state.videoInfo);
+    else document.getElementById("videoSummary").style.display = "none";
+  },
+
+  updateVideoOutputPath(itemId, value) {
+    if (this._guardRenderLocked()) return;
+    const item = this.state.videoItems.find(v => v.id === itemId);
+    if (!item) return;
+    if (!item.render_settings) item.render_settings = {};
+    item.render_settings.output_path = value;
   },
 
   // ── 步骤导航 ──────────────────────────
@@ -94,6 +342,7 @@ const App = {
 
   // ── FIT 加载 ──────────────────────────
   async loadFit() {
+    if (this._guardRenderLocked()) return;
     const path = document.getElementById("fitPathInput").value.trim();
     if (!path) { this.toast("请输入 FIT 文件路径", "error"); return; }
 
@@ -243,6 +492,7 @@ const App = {
 
   // ── 视频加载 ──────────────────────────
   async loadVideo() {
+    if (this._guardRenderLocked()) return;
     const path = document.getElementById("videoPathInput").value.trim();
     if (!path) { this.toast("请输入视频文件路径", "error"); return; }
 
@@ -260,12 +510,33 @@ const App = {
 
     try {
       const data = await API.loadVideo(path);
-      this.state.videoId = data.id;
-      this.state.videoInfo = data.info;
+      const item = this._normalizeVideoItem({
+        id: data.id,
+        video_path: data.id,
+        video_info: data.info,
+        sync_status: "pending",
+      });
+
+      const existing = this.state.videoItems[0]?.video_info;
+      if (existing && (existing.width !== data.info.width || existing.height !== data.info.height)) {
+        throw new Error(`批量模式要求相同分辨率，当前已加入 ${existing.width}×${existing.height}，新视频为 ${data.info.width}×${data.info.height}`);
+      }
+
+      const found = this.state.videoItems.findIndex(v => v.video_path === item.video_path);
+      if (found >= 0) {
+        this.state.videoItems[found] = { ...this.state.videoItems[found], ...item };
+      } else {
+        this.state.videoItems.push(item);
+      }
+      this._ensureVideoItemRenderDefaults(item);
+      this.state.selectedVideoItemId = item.id;
+      this._syncSelectedVideoToLegacyState();
       this.showVideoSummary(data.info);
+      this.renderVideoList();
+      this.renderRenderTargetList();
       status.className = "status-msg success";
-      status.textContent = "✅ 视频加载成功";
-      this.toast("视频加载成功", "success");
+      status.textContent = "✅ 视频已加入批量列表";
+      this.toast("视频已加入批量列表", "success");
     } catch (e) {
       status.className = "status-msg error";
       status.textContent = `❌ ${e.message}`;
@@ -279,12 +550,18 @@ const App = {
 
   showVideoSummary(info) {
     document.getElementById("videoSummary").style.display = "";
+    const selected = this.getSelectedVideoItem();
     document.getElementById("videoRes").textContent = `${info.width}×${info.height}`;
     document.getElementById("videoFps").textContent = info.fps;
     document.getElementById("videoDur").textContent = this.formatDuration(info.duration);
     document.getElementById("videoCodec").textContent = info.codec.toUpperCase();
     document.getElementById("videoThumb").src = API.getVideoThumbnail(this.state.videoId);
     document.getElementById("videoFpsOverride").placeholder = info.fps;
+    if (selected?.render_settings?.fps) {
+      document.getElementById("videoFpsOverride").value = selected.render_settings.fps;
+    }
+    document.getElementById("selectedVideoLabel").textContent =
+      selected ? `当前选中: ${(selected.video_path || "").split(/[\\/]/).pop()}` : "当前选中: --";
     if (info.fps > 100) {
       document.getElementById("timeScaleSelect").value = "30";
     }
@@ -820,7 +1097,18 @@ const App = {
   },
 
   // ── Step 3: 时间同步 ──────────────────
+  saveCurrentSyncToSelectedVideo() {
+    const item = this.getSelectedVideoItem();
+    if (!item) return;
+    item.sync_mode = this.state.syncMode || "auto";
+    item.time_sync = this.getTimeSync(false);
+    item.sync_status = item.time_sync?.video_start_time
+      ? (item.sync_mode === "auto" ? "auto" : item.sync_mode)
+      : "missing_time";
+  },
+
   initStep3() {
+    this._syncSelectedVideoToLegacyState();
     const session = this.state.fitData?.sessions?.[0];
     if (session) {
       const endStr = session.total_elapsed_time
@@ -838,15 +1126,18 @@ const App = {
       const syncTimeScale = document.getElementById("syncTimeScale");
       if (syncTimeScale && step1Scale) syncTimeScale.value = step1Scale;
     }
-    // 自动填充视频起始时间
-    this._prefillVideoStartTime();
-    if (this.state.syncMode === "auto") this.autoSync();
+    this.renderVideoList();
+    const selected = this.getSelectedVideoItem();
+    document.getElementById("syncSelectedVideoLabel").textContent =
+      selected ? `当前视频: ${(selected.video_path || "").split(/[\\/]/).pop()}` : "当前视频: --";
+    this._loadSelectedSyncToForm();
+    if (this.state.syncMode === "auto" && !this.state.isRenderLocked) this.autoSync();
     this.initSyncMap();
   },
 
   /** 从视频文件名（DJI 格式）或文件修改时间自动推断 video_start_time */
-  _inferVideoStartTime() {
-    const videoInfo = this.state.videoInfo;
+  _inferVideoStartTimeForItem(item = null) {
+    const videoInfo = item?.video_info || this.state.videoInfo;
     if (!videoInfo) return null;
     // 1. 尝试从 DJI 文件名解析：DJI_20260404073819_0003_D.MP4
     const fname = (videoInfo.file_path || "").split(/[\\/]/).pop() || "";
@@ -860,6 +1151,10 @@ const App = {
       return new Date(new Date(videoInfo.file_mtime).getTime() - videoInfo.duration * 1000);
     }
     return null;
+  },
+
+  _inferVideoStartTime() {
+    return this._inferVideoStartTimeForItem(this.getSelectedVideoItem());
   },
 
   /** 预填充视频起始时间输入框 */
@@ -904,26 +1199,30 @@ const App = {
     }
   },
 
-  setSyncMode(mode) {
+  setSyncMode(mode, options = {}) {
+    if (!options.silent && this._guardRenderLocked()) return;
     this.state.syncMode = mode;
     document.getElementById("syncManual").style.display = mode === "manual" ? "" : "none";
     document.getElementById("syncAuto").style.display = mode === "auto" ? "" : "none";
     document.getElementById("syncKeyframe").style.display = mode === "keyframe" ? "" : "none";
     if (mode === "auto") this.autoSync();
     if (mode === "manual") this._updateManualComputed();
+    const item = this.getSelectedVideoItem();
+    if (item) item.sync_mode = mode;
   },
 
   autoSync() {
     const session = this.state.fitData?.sessions?.[0];
-    const videoInfo = this.state.videoInfo;
     const result = document.getElementById("syncAutoResult");
     if (!session?.start_time) {
       result.innerHTML = "<p style='color:var(--warning)'>⚠️ 无 FIT 起始时间</p>";
       return;
     }
-    const inferred = this._inferVideoStartTime();
+    const item = this.getSelectedVideoItem();
+    const inferred = this._inferVideoStartTimeForItem(item);
     if (!inferred) {
       result.innerHTML = "<p style='color:var(--warning)'>⚠️ 无法自动推断视频起始时间</p>";
+      if (item) item.sync_status = "missing_time";
       return;
     }
     const fitStart = new Date(session.start_time);
@@ -934,6 +1233,50 @@ const App = {
       <p>FIT 起始时间: <strong>${fitStart.toLocaleString()}</strong></p>
       <p>两者差: <strong>${sign}${diff.toFixed(1)}s</strong> ${Math.abs(diff) < 2 ? "✅ 基本同步" : diff > 0 ? "(视频早于 FIT)" : "(视频晚于 FIT)"}</p>
     `;
+    if (item) {
+      item.time_sync = {
+        video_start_time: inferred.toISOString(),
+        fit_start_time: session.start_time,
+        offset_seconds: 0,
+        time_scale: item.time_sync?.time_scale || this.getTimeScale(),
+      };
+      item.sync_status = "auto";
+    }
+    this.renderVideoList();
+  },
+
+  autoSyncAllVideos() {
+    if (this._guardRenderLocked()) return;
+    const session = this.state.fitData?.sessions?.[0];
+    if (!session?.start_time) {
+      this.toast("当前 FIT 缺少起始时间，无法批量推断", "error");
+      return;
+    }
+    let successCount = 0;
+    let missingCount = 0;
+    const baseScale = this.getTimeScale();
+    this.state.videoItems.forEach(item => {
+      const inferred = this._inferVideoStartTimeForItem(item);
+      item.sync_mode = "auto";
+      item.time_sync = {
+        ...(item.time_sync || {}),
+        video_start_time: inferred ? inferred.toISOString() : null,
+        fit_start_time: session.start_time,
+        offset_seconds: 0,
+        time_scale: item.time_sync?.time_scale || baseScale,
+      };
+      item.sync_status = inferred ? "auto" : "missing_time";
+      if (inferred) successCount += 1;
+      else missingCount += 1;
+    });
+    this.renderVideoList();
+    this._loadSelectedSyncToForm();
+    this.toast(
+      missingCount
+        ? `已自动对齐 ${successCount} 个视频，另有 ${missingCount} 个缺少可推断时间戳`
+        : `已自动对齐全部 ${successCount} 个视频`,
+      missingCount ? "info" : "success"
+    );
   },
 
   /** 获取视频起始时间（绝对时间） */
@@ -959,11 +1302,12 @@ const App = {
   },
 
   /** 构建 time_sync 对象（统一接口） */
-  getTimeSync() {
+  getTimeSync(useSelectedFallback = true) {
     const videoStartTime = this.getVideoStartTime();
     const session = this.state.fitData?.sessions?.[0];
+    const selected = useSelectedFallback ? this.getSelectedVideoItem() : null;
     return {
-      video_start_time: videoStartTime ? videoStartTime.toISOString() : null,
+      video_start_time: videoStartTime ? videoStartTime.toISOString() : (selected?.time_sync?.video_start_time || null),
       fit_start_time: session?.start_time || null,
       offset_seconds: this.getSyncOffset(),
       time_scale: this.getTimeScale(),
@@ -985,6 +1329,7 @@ const App = {
     const diff = (fitStart.getTime() - videoStartTime.getTime()) / 1000 + offset;
     const sign = diff >= 0 ? "+" : "";
     el.innerHTML = `<span class='text-muted'>视频 0s → FIT ${sign}${diff.toFixed(1)}s | FIT 起始: ${fitStart.toLocaleString()} | 视频起始: ${videoStartTime.toLocaleString()}</span>`;
+    this.saveCurrentSyncToSelectedVideo();
   },
 
   _videoFrameDebounce: null,
@@ -1060,6 +1405,10 @@ const App = {
     if (this.state.syncMode === "manual" && syncTimeScale && syncTimeScale.value) {
       return parseFloat(syncTimeScale.value) || 1;
     }
+    const selected = this.getSelectedVideoItem();
+    if (selected?.time_sync?.time_scale) {
+      return parseFloat(selected.time_sync.time_scale) || 1;
+    }
     // 否则用 Step 1 视频面板中的延时倍率
     const sel = document.getElementById("timeScaleSelect").value;
     if (sel === "custom") return parseFloat(document.getElementById("customTimeScale").value || 1);
@@ -1067,6 +1416,7 @@ const App = {
   },
 
   addKeyframe() {
+    if (this._guardRenderLocked()) return;
     const idx = this.state.keyframes.length + 1;
     this.state.keyframes.push({ video_sec: 0, fit_time: null });
     const tbody = document.querySelector("#keyframeTable tbody");
@@ -1079,6 +1429,33 @@ const App = {
     tbody.appendChild(tr);
   },
 
+  applyCurrentSyncToAll() {
+    if (this._guardRenderLocked()) return;
+    this.saveCurrentSyncToSelectedVideo();
+    const selected = this.getSelectedVideoItem();
+    if (!selected) return;
+    const baseSync = JSON.parse(JSON.stringify(selected.time_sync || {}));
+    const baseMode = selected.sync_mode || this.state.syncMode || "auto";
+    this.state.videoItems.forEach(item => {
+      const inferred = this._inferVideoStartTimeForItem(item);
+      item.time_sync = {
+        ...(item.time_sync || {}),
+        fit_start_time: baseSync.fit_start_time || this.state.fitData?.sessions?.[0]?.start_time || null,
+        offset_seconds: baseMode === "manual" ? (baseSync.offset_seconds ?? 0) : 0,
+        time_scale: baseSync.time_scale || this.getTimeScale(),
+        video_start_time: item.id === selected.id
+          ? (baseSync.video_start_time || (inferred ? inferred.toISOString() : null))
+          : (item.time_sync?.video_start_time || (inferred ? inferred.toISOString() : null)),
+      };
+      item.sync_mode = baseMode;
+      item.sync_status = item.time_sync.video_start_time
+        ? (baseMode === "auto" ? "auto" : baseMode)
+        : "missing_time";
+    });
+    this.renderVideoList();
+    this.toast("已将当前模式、倍率和偏移应用到全部视频，并保留各自时间戳", "success");
+  },
+
   // ── Step 4: 叠加设计 ──────────────────
   async initStep4() {
     await this.loadTemplates();
@@ -1088,6 +1465,32 @@ const App = {
       document.getElementById("overlayTimeSlider").max = this.state.videoInfo.duration;
       document.getElementById("overlayTimeSlider").step = 1 / (this.state.videoInfo.fps || 29.97);
     }
+  },
+
+  _loadSelectedSyncToForm() {
+    const item = this.getSelectedVideoItem();
+    const ts = item?.time_sync || {};
+    const input = document.getElementById("syncVideoStartTime");
+    const hint = document.getElementById("syncVideoStartHint");
+    const offset = document.getElementById("syncManualOffset");
+    const scale = document.getElementById("syncTimeScale");
+    if (input) input.value = "";
+    if (hint) hint.textContent = "";
+    if (offset) offset.value = ts.offset_seconds ?? 0;
+    if (scale) scale.value = ts.time_scale || this.getTimeScale();
+    if (ts.video_start_time && input) {
+      const dt = new Date(ts.video_start_time);
+      const local = new Date(dt.getTime() - dt.getTimezoneOffset() * 60000);
+      input.value = local.toISOString().slice(0, 23);
+      if (hint) hint.textContent = "(来自已保存配置)";
+    } else {
+      this._prefillVideoStartTime();
+    }
+    const nextMode = item?.sync_mode || this.state.syncMode || "auto";
+    const radio = document.querySelector(`input[name="syncMode"][value="${nextMode}"]`);
+    if (radio) radio.checked = true;
+    this.setSyncMode(nextMode, { silent: true });
+    this._updateManualComputed();
   },
 
   async loadTemplates() {
@@ -1873,9 +2276,12 @@ const App = {
   // ── Step 5: 渲染导出 ──────────────────
   initStep5() {
     if (this.state.videoInfo) {
-      document.getElementById("outputPath").value = this.state.videoInfo.file_path.replace(/\.[^.]+$/, "_overlay.mp4");
+      const selected = this.getSelectedVideoItem();
+      if (selected) this._ensureVideoItemRenderDefaults(selected);
+      document.getElementById("outputPath").value = selected?.render_settings?.output_path || this.state.videoInfo.file_path.replace(/\.[^.]+$/, "_overlay.mp4");
       document.getElementById("renderEnd").value = this.formatDuration(this.state.videoInfo.duration);
     }
+    this.renderRenderTargetList();
 
     // 编码器切换时联动预设选项和输出扩展名
     const codecSelect = document.getElementById("renderCodec");
@@ -1967,16 +2373,28 @@ const App = {
   },
 
   async startRender() {
+    if (this.state.isRenderLocked) {
+      this.toast("当前已有渲染任务在执行", "info");
+      return;
+    }
     if (!this.state.fitId) { this.toast("请先加载 FIT 文件", "error"); return; }
-    if (!this.state.videoId) { this.toast("请先加载视频文件", "error"); return; }
+    if (!this.state.videoItems.length) { this.toast("请先至少加入一个视频", "error"); return; }
+    this.saveCurrentSyncToSelectedVideo();
 
     const btn = document.getElementById("startRenderBtn");
     btn.disabled = true;
-    btn.textContent = "渲染中...";
+    btn.textContent = "批量渲染中...";
+    this._setRenderLock(true);
+    this._resetRenderLogView();
+    this.state.renderTaskId = null;
+    this.state.renderActiveTaskId = null;
+    this.state.renderActiveTaskIds = [];
+    this.state.renderBatchId = null;
+    this.renderBatchJobs([]);
 
-    const session = this.state.fitData?.sessions?.[0];
-    const videoInfo = this.state.videoInfo;
-    let startSec = 0, endSec = videoInfo?.duration || 0;
+    let startSec = 0;
+    const selectedInfo = this.getSelectedVideoItem()?.video_info || this.state.videoInfo;
+    let endSec = selectedInfo?.duration || 0;
     const rangeMode = document.querySelector('input[name="renderRange"]:checked')?.value || "all";
     if (rangeMode === "custom") {
       startSec = this.parseTimeStr(document.getElementById("renderStart").value);
@@ -1986,102 +2404,105 @@ const App = {
     try {
       const overlayOnly = document.getElementById("renderOverlayOnly")?.checked || false;
       const overlayCodec = document.getElementById("renderOverlayCodec")?.value || "qtrle";
+      const sharedRenderSettings = {
+        output_path: document.getElementById("outputPath").value,
+        codec: overlayOnly ? overlayCodec : document.getElementById("renderCodec").value,
+        preset: document.getElementById("renderPreset").value,
+        crf: parseInt(document.getElementById("renderCrf").value),
+        audio: overlayOnly ? "none" : document.querySelector('input[name="renderAudio"]:checked').value,
+        overlay_only: overlayOnly,
+        overlay_codec: overlayCodec,
+        hwaccel_decode: document.getElementById("renderHwaccelDecode")?.checked || false,
+        batch_concurrency: Math.max(1, parseInt(document.getElementById("renderBatchConcurrency")?.value) || 1),
+        render_mode: document.getElementById("renderMode")?.value || "pipeline",
+        max_ticks: parseInt(document.getElementById("renderMaxTicks")?.value) || null,
+        width: selectedInfo?.width || 1920,
+        height: selectedInfo?.height || 1080,
+        fps: parseFloat(document.getElementById("videoFpsOverride").value) || selectedInfo?.fps || 29.97,
+        start_sec: startSec,
+        end_sec: endSec,
+      };
       const data = await API.startRender({
         project: {
-          fit_path: this.state.fitId, video_path: this.state.videoId,
+          fit_path: this.state.fitId,
+          video_items: this.state.videoItems.map(item => ({
+            id: item.id,
+            video_path: item.video_path,
+            time_sync: item.time_sync || {},
+            sync_mode: item.sync_mode || "auto",
+            render_settings: {
+              ...(item.render_settings || {}),
+              output_path: item.render_settings?.output_path || this._defaultOutputPathForVideo(item.video_path, overlayOnly, overlayCodec),
+            },
+          })),
           widgets: this.state.widgets,
-          time_sync: this.getTimeSync(),
-          render_settings: {
-            output_path: document.getElementById("outputPath").value,
-            codec: overlayOnly ? overlayCodec : document.getElementById("renderCodec").value,
-            preset: document.getElementById("renderPreset").value,
-            crf: parseInt(document.getElementById("renderCrf").value),
-            audio: overlayOnly ? "none" : document.querySelector('input[name="renderAudio"]:checked').value,
-            overlay_only: overlayOnly,
-            hwaccel_decode: document.getElementById("renderHwaccelDecode")?.checked || false,
-            render_mode: document.getElementById("renderMode")?.value || "pipeline",
-            max_ticks: parseInt(document.getElementById("renderMaxTicks")?.value) || null,
-            width: videoInfo?.width || 1920, height: videoInfo?.height || 1080,
-            fps: parseFloat(document.getElementById("videoFpsOverride").value) || videoInfo?.fps || 29.97,
-            start_sec: startSec, end_sec: endSec,
-          },
+          global_style: this.state.globalStyle,
+          render_settings: sharedRenderSettings,
         },
       });
-      this.state.renderTaskId = data.task_id;
+      this.state.renderBatchId = data.batch_id;
+      this.state.renderActiveTaskId = data.active_task_id || null;
+      this.state.renderActiveTaskIds = data.active_task_ids || [];
       document.getElementById("renderProgress").style.display = "";
-      // 默认展开日志面板
       document.getElementById("renderLogContainer").style.display = "";
-      document.getElementById("renderLogToggle").textContent = "▼";
-      // 隐藏命令回显（等后端推送命令后再显示）
-      document.getElementById("renderCmdContainer").style.display = "none";
       this._renderStartTime = Date.now();
+      this.renderBatchJobs(data.jobs || []);
+      const initialTaskId = data.active_task_id || data.task_id || data.jobs?.[0]?.task_id || null;
+      if (initialTaskId) this.selectRenderTask(initialTaskId, { force: true });
       this.pollRenderStatus();
-      this._startLogPolling();
     } catch (e) {
       this.toast(`渲染启动失败: ${e.message}`, "error");
+      this._setRenderLock(false);
       btn.disabled = false;
-      btn.textContent = "▶ 开始渲染";
+      btn.textContent = "▶ 开始批量渲染";
     }
   },
 
   async pollRenderStatus() {
-    if (!this.state.renderTaskId) return;
+    if (!this.state.renderBatchId) return;
     try {
-      const data = await API.getRenderStatus(this.state.renderTaskId);
-      const pct = data.progress || 0;
+      const data = await API.getRenderBatchStatus(this.state.renderBatchId);
+      const pct = data.overall_progress || 0;
       document.getElementById("progressFill").style.width = pct + "%";
       document.getElementById("progressPercent").textContent = pct.toFixed(1) + "%";
-      document.getElementById("progressFrames").textContent = `${data.current_frame || 0}/${data.total_frames || 0} 帧`;
+      const counts = data.status_counts || {};
+      document.getElementById("progressFrames").textContent = `完成 ${counts.completed || 0}/${data.total_jobs || 0} 个任务`;
+      document.getElementById("progressOverlaySpeed").textContent = `🗂 运行中 ${counts.running || 0}`;
+      document.getElementById("progressEncodeSpeed").textContent = `⚠ 失败 ${counts.error || 0}`;
+      this.state.renderActiveTaskId = data.active_task_id || null;
+      this.state.renderActiveTaskIds = data.active_task_ids || [];
+      this.renderBatchJobs(data.jobs || []);
 
-      // 帧生成速度 & 编码速度
-      const overlayFps = data.overlay_fps || 0;
-      const encodeFps = data.encode_fps || 0;
-      document.getElementById("progressOverlaySpeed").textContent = `🎨 ${overlayFps.toFixed(1)} fps`;
-      document.getElementById("progressEncodeSpeed").textContent = `🎬 ${encodeFps.toFixed(1)} fps`;
-
-      // 详细信息行
       const detail = document.getElementById("progressDetail");
       if (detail) {
-        const elapsed = data.elapsed_sec || 0;
-        const phase = data.phase || "rendering";
-        const phaseLabel = { rendering: "渲染中", encoding: "编码音频", done: "完成", error: "出错", cancelled: "已取消" }[phase] || phase;
-        let detailHtml = `<span>⏱ 已用时 ${this.formatDuration(elapsed)}</span>`;
-        detailHtml += ` <span>| ${phaseLabel}</span>`;
-        if (overlayFps > 0 && encodeFps > 0 && overlayFps < encodeFps) {
-          detailHtml += ` <span style="color:var(--warning)">⚠ 帧生成速度低于编码速度（瓶颈: overlay 渲染）</span>`;
-        }
-        detail.innerHTML = detailHtml;
+        detail.innerHTML = `<span>批量状态: ${this._renderTaskStatusLabel(data.status)}</span> <span>| 并发 ${data.max_concurrent || 1}</span> <span>| 排队 ${counts.queued || 0}</span> <span>| 已取消 ${counts.cancelled || 0}</span>`;
       }
 
-      // 预计剩余
-      if (data.eta_sec && data.eta_sec > 0) {
-        const min = Math.floor(data.eta_sec / 60);
-        const sec = Math.floor(data.eta_sec % 60);
-        document.getElementById("progressEta").textContent = `预计剩余: ${min}:${String(sec).padStart(2, "0")}`;
-      } else if (data.current_frame > 0 && this._renderStartTime) {
-        const elapsedSec = (Date.now() - this._renderStartTime) / 1000;
-        const rate = data.current_frame / elapsedSec;
-        if (rate > 0) {
-          const remaining = (data.total_frames - data.current_frame) / rate;
-          const min = Math.floor(remaining / 60);
-          const sec = Math.floor(remaining % 60);
-          document.getElementById("progressEta").textContent = `预计剩余: ${min}:${String(sec).padStart(2, "0")}`;
-        }
+      document.getElementById("progressEta").textContent = `批次: ${data.batch_id}`;
+      const selectedTaskStillExists = (data.jobs || []).some(job => job.task_id === this.state.renderTaskId);
+      if (!selectedTaskStillExists) this.state.renderTaskId = null;
+      if (!this.state.renderTaskId) {
+        const preferredTaskId = data.active_task_id || data.jobs?.find(job => job.status === "running")?.task_id || data.jobs?.[0]?.task_id || null;
+        if (preferredTaskId) this.selectRenderTask(preferredTaskId, { force: true });
+      } else {
+        this._updateRenderLogTaskLabel();
       }
 
-      if (data.status === "completed") {
-        this.toast("渲染完成！", "success");
-        document.getElementById("startRenderBtn").disabled = false;
-        document.getElementById("startRenderBtn").textContent = "▶ 开始渲染";
+      if (data.status === "completed" || data.status === "completed_with_errors") {
+        this._setRenderLock(false);
+        await this._fetchRenderLogs();
         this._stopLogPolling();
-        this._fetchRenderLogs(); // 获取最终日志
+        this.toast(data.status === "completed" ? "批量渲染完成！" : "批量渲染完成，但存在失败项", data.status === "completed" ? "success" : "info");
+        document.getElementById("startRenderBtn").disabled = false;
+        document.getElementById("startRenderBtn").textContent = "▶ 开始批量渲染";
         return;
       } else if (data.status === "cancelled" || data.status === "error") {
-        this.toast(data.status === "error" ? `渲染出错: ${data.error || ''}` : "渲染已取消", data.status === "error" ? "error" : "info");
-        document.getElementById("startRenderBtn").disabled = false;
-        document.getElementById("startRenderBtn").textContent = "▶ 开始渲染";
+        this._setRenderLock(false);
+        await this._fetchRenderLogs();
         this._stopLogPolling();
-        this._fetchRenderLogs(); // 获取最终日志
+        this.toast(data.status === "error" ? "批量渲染出错" : "批量渲染已取消", data.status === "error" ? "error" : "info");
+        document.getElementById("startRenderBtn").disabled = false;
+        document.getElementById("startRenderBtn").textContent = "▶ 开始批量渲染";
         return;
       }
       setTimeout(() => this.pollRenderStatus(), 1000);
@@ -2094,11 +2515,13 @@ const App = {
   _logLineCount: 0,
 
   _startLogPolling() {
+    this._stopLogPolling();
     this._logPollIndex = 0;
     this._logLineCount = 0;
     const logPanel = document.getElementById("renderLogPanel");
     if (logPanel) logPanel.innerHTML = "";
     this._updateLogCount();
+    this._updateRenderLogTaskLabel();
     this._pollLogs();
   },
 
@@ -2218,6 +2641,13 @@ const App = {
   },
 
   async cancelRender() {
+    if (this.state.renderBatchId) {
+      try {
+        await API.cancelRenderBatch(this.state.renderBatchId);
+        this.toast("批量渲染已取消", "info");
+      } catch (e) { console.error(e); }
+      return;
+    }
     if (!this.state.renderTaskId) return;
     try { await API.cancelRender(this.state.renderTaskId); this.toast("渲染已取消", "info"); }
     catch (e) { console.error(e); }
@@ -2232,6 +2662,7 @@ const App = {
 
   // ── 项目管理 ──────────────────────────
   async newProject() {
+    if (this._guardRenderLocked()) return;
     const name = prompt("项目名称:", "新项目");
     if (!name) return;
     try {
@@ -2247,6 +2678,7 @@ const App = {
 
   /** 收集当前完整项目配置 */
   _collectProjectData() {
+    this.saveCurrentSyncToSelectedVideo();
     // 收集 sanitize config
     let sanitizeConfig = null;
     const sanGpsGlitch = document.getElementById("sanGpsGlitch");
@@ -2294,11 +2726,17 @@ const App = {
       overlay_only: document.getElementById("renderOverlayOnly")?.checked || false,
       overlay_codec: document.getElementById("renderOverlayCodec")?.value || "qtrle",
       hwaccel_decode: document.getElementById("renderHwaccelDecode")?.checked || false,
+      batch_concurrency: Math.max(1, parseInt(document.getElementById("renderBatchConcurrency")?.value) || 1),
     };
+
+    this.state.videoItems.forEach(item => {
+      this._ensureVideoItemRenderDefaults(item);
+    });
 
     return {
       fit_path: this.state.fitId || "",
       video_path: this.state.videoId || "",
+      video_items: this.state.videoItems,
       overlay_template_name: this.state.templateName,
       widgets: this.state.widgets,
       global_style: this.state.globalStyle,
@@ -2310,6 +2748,7 @@ const App = {
   },
 
   async saveProject() {
+    if (this._guardRenderLocked()) return;
     if (!this.state.projectId) { await this.newProject(); return; }
     try {
       await API.updateProject(this.state.projectId, this._collectProjectData());
@@ -2318,6 +2757,7 @@ const App = {
   },
 
   async openProject() {
+    if (this._guardRenderLocked()) return;
     try {
       const projects = await API.listProjects();
       if (!projects.length) {
@@ -2335,8 +2775,8 @@ const App = {
       html += `<div class="project-item" data-id="${p.id}">
         <div class="project-item-info">
           <div class="project-item-name">${p.name || "未命名"}</div>
-          <div class="project-item-meta">${date} · ${p.widget_count || 0} 个组件</div>
-          <div class="project-item-paths">${p.fit_path ? "✅ FIT" : "❌ FIT"} ${p.video_path ? "✅ 视频" : "❌ 视频"}</div>
+          <div class="project-item-meta">${date} · ${p.widget_count || 0} 个组件 · ${p.video_count || (p.video_path ? 1 : 0)} 个视频</div>
+          <div class="project-item-paths">${p.fit_path ? "✅ FIT" : "❌ FIT"} ${(p.video_count || (p.video_path ? 1 : 0)) > 0 ? "✅ 视频" : "❌ 视频"}</div>
         </div>
         <div class="project-item-actions">
           <button onclick="App.loadProject('${p.id}')" class="btn-primary btn-sm">打开</button>
@@ -2350,6 +2790,7 @@ const App = {
   },
 
   async loadProject(projectId) {
+    if (this._guardRenderLocked()) return;
     try {
       const data = await API.getProject(projectId);
       document.getElementById("projectListModal").style.display = "none";
@@ -2372,30 +2813,44 @@ const App = {
         await this.loadFit();
       }
 
-      // 还原视频
-      if (data.video_path) {
-        document.getElementById("videoPathInput").value = data.video_path;
-        await this.loadVideo();
-      }
-
-      // 还原 time_sync
-      if (data.video_config?.time_sync) {
-        const ts = data.video_config.time_sync;
-        if (ts.time_scale) {
-          const scale = ts.time_scale;
+      // 还原批量视频
+      const projectVideoItems = (data.video_items && data.video_items.length)
+        ? data.video_items
+        : (data.video_path ? [{ id: "video_1", video_path: data.video_path, time_sync: data.video_config?.time_sync || {} }] : []);
+      const paths = projectVideoItems.map(v => v.video_path).filter(Boolean);
+      this.state.videoItems = [];
+      this.state.selectedVideoItemId = null;
+      if (paths.length) {
+        const loaded = await API.loadVideoBatch(paths);
+        this.state.videoItems = loaded.items.map((loadedItem, idx) => {
+          const saved = projectVideoItems.find(v => v.video_path === loadedItem.id) || projectVideoItems[idx] || {};
+          return this._normalizeVideoItem({
+            ...saved,
+            id: saved.id || loadedItem.id,
+            video_path: loadedItem.id,
+            video_info: loadedItem.info,
+            sync_status: saved.sync_status || (saved.sync_mode || "pending"),
+          });
+        });
+        this.state.selectedVideoItemId = this.state.videoItems[0]?.id || null;
+        this._syncSelectedVideoToLegacyState();
+        const firstTs = this.state.videoItems[0]?.time_sync || {};
+        if (firstTs.time_scale) {
+          const scale = firstTs.time_scale;
           const sel = document.getElementById("timeScaleSelect");
           if (scale === 1) sel.value = "1";
           else if (scale === 30) sel.value = "30";
-          else { sel.value = "custom"; document.getElementById("customTimeScaleLabel").style.display = ""; }
-          if (sel.value === "custom") {
+          else {
+            sel.value = "custom";
+            document.getElementById("customTimeScaleLabel").style.display = "";
             document.getElementById("customTimeScale").value = scale;
           }
         }
-        if (ts.video_start_time) {
-          const dt = new Date(ts.video_start_time);
-          const local = new Date(dt.getTime() - dt.getTimezoneOffset() * 60000);
-          document.getElementById("syncManualStart")?.setAttribute("value", local.toISOString().slice(0, 16));
+        if (this.state.videoInfo) {
+          document.getElementById("videoPathInput").value = this.state.videoId;
+          this.showVideoSummary(this.state.videoInfo);
         }
+        this.renderVideoList();
       }
 
       // 还原 sanitize config
@@ -2441,6 +2896,9 @@ const App = {
         if (rs.overlay_codec) {
           this._setInput("renderOverlayCodec", rs.overlay_codec);
         }
+        if (rs.batch_concurrency) {
+          this._setInput("renderBatchConcurrency", rs.batch_concurrency);
+        }
         // 联动显示 overlay codec 选择
         const overlayCb = document.getElementById("renderOverlayOnly");
         const overlayCodec = document.getElementById("renderOverlayCodec");
@@ -2448,6 +2906,8 @@ const App = {
           overlayCodec.style.display = overlayCb.checked ? "" : "none";
         }
       }
+
+      this.renderRenderTargetList();
 
       // 跳到叠加设计步骤显示 widget
       this.goStep(4);
@@ -2491,6 +2951,7 @@ const App = {
   _fbState: { targetInput: null, currentPath: "", parentPath: "", selectedItem: null, selectedPath: "", exts: "" },
 
   browseFitFile() {
+    if (this._guardRenderLocked()) return;
     this._fbState.targetInput = "fit";
     this._fbState.exts = ".fit";
     this._fbState.selectedItem = null;
@@ -2503,6 +2964,7 @@ const App = {
   },
 
   browseVideoFile() {
+    if (this._guardRenderLocked()) return;
     this._fbState.targetInput = "video";
     this._fbState.exts = ".mp4,.mov,.avi,.mkv,.m4v";
     this._fbState.selectedItem = null;

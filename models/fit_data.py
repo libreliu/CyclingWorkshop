@@ -136,6 +136,7 @@ class FitData:
     haversine_total_distance: float = 0.0  # GPS haversine 全路径积分总距离 (m)，辅助信息
     _glitch_cache: dict = field(default=None, repr=False)  # GPS glitch 缓存
     _track_coords_cache: tuple = field(default=None, repr=False)  # 轨迹坐标缓存 (cache_key, coords)
+    _distance_is_fallback: bool = field(default=False, repr=False)  # 逐点 distance 是否为项目回退重建值
 
     def get_glitch_cache(self, max_speed_ms: float = 55.0) -> dict:
         """获取或计算 GPS glitch 缓存"""

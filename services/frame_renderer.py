@@ -471,18 +471,7 @@ class FrameRenderer:
         # 总距离
         total_km = None
         if distance_mode == "current_total" and fit_data:
-            session = fit_data.primary_session
-            # 优先使用 session.total_distance（FIT 文件内置，最可靠）
-            if session and session.total_distance > 0:
-                total_km = session.total_distance / 1000
-            # 回退到 haversine_total_distance（GPS 坐标积分，受 GPS 精度影响）
-            elif fit_data.haversine_total_distance > 0:
-                total_km = fit_data.haversine_total_distance / 1000
-            # 最后回退：取 records 最后一条的 distance
-            elif value is not None and session and session.records:
-                last = session.records[-1]
-                if last and last.distance is not None:
-                    total_km = last.distance / 1000
+            total_km = FrameRenderer._resolve_total_distance_km(fit_data)
 
         if distance_mode == "current_total" and total_km is not None:
             # ── 模式：当前 / 总距离 ──
@@ -596,6 +585,40 @@ class FrameRenderer:
             FrameRenderer._render_gauge(draw, widget, record, "distance",
                                         lambda v: v / 1000,
                                         global_style=gstyle)  # m → km
+
+    @staticmethod
+    def _resolve_total_distance_km(fit_data) -> Optional[float]:
+        """计算距离组件展示用的总距离（km）。
+
+        规则：
+        - 基准优先使用 session.total_distance
+        - 若记录中的最大 current distance 更大，则总距离至少取该最大值
+        - 若 session.total_distance 不可用，再回退到 haversine_total_distance
+        """
+        if not fit_data:
+            return None
+
+        session = fit_data.primary_session
+        session_total_m = 0.0
+        if session and session.total_distance and session.total_distance > 0:
+            session_total_m = float(session.total_distance)
+
+        max_record_distance_m = 0.0
+        if session and session.records:
+            valid_distances = [
+                float(rec.distance) for rec in session.records
+                if getattr(rec, "distance", None) is not None
+            ]
+            if valid_distances:
+                max_record_distance_m = max(valid_distances)
+
+        if session_total_m > 0 or max_record_distance_m > 0:
+            return max(session_total_m, max_record_distance_m) / 1000.0
+
+        if fit_data.haversine_total_distance > 0:
+            return fit_data.haversine_total_distance / 1000.0
+
+        return None
 
     @staticmethod
     def _render_timer(draw, widget, record, fit_data, fit_time,

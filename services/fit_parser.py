@@ -226,6 +226,7 @@ class FitParserService:
 
         fit_data = FitData(file_path=file_path)
         available_fields = set()
+        native_distance_available = False
 
         # 单次遍历：同时解析 sessions / records / lap markers
         sessions = []
@@ -308,6 +309,7 @@ class FitParserService:
                 if dist is not None:
                     rec.distance = float(dist)
                     available_fields.add("distance")
+                    native_distance_available = True
 
                 pwr = getattr(msg, 'power', None)
                 if pwr is not None:
@@ -355,34 +357,91 @@ class FitParserService:
         fit_data.available_fields = sorted(available_fields)
         fit_data.lap_markers = lap_markers
 
-        # ── haversine 全路径积分：计算总距离（辅助信息）+ Distance 回退 ──
-        if records:
-            cum_dist = 0.0
-            prev_lat, prev_lon = None, None
-            has_any_coord = any(r.latitude is not None and r.longitude is not None for r in records)
-            need_distance_fallback = "distance" not in available_fields
-            if has_any_coord:
-                for r in records:
-                    if r.latitude is not None and r.longitude is not None:
-                        if prev_lat is not None and prev_lon is not None:
-                            cum_dist += FitSanitize.haversine(prev_lat, prev_lon, r.latitude, r.longitude)
-                        prev_lat, prev_lon = r.latitude, r.longitude
-                    # 回退：写入每条 record.distance
-                    if need_distance_fallback:
-                        r.distance = cum_dist
-                fit_data.haversine_total_distance = cum_dist
-                if need_distance_fallback:
-                    available_fields.add("distance")
-                    fit_data.available_fields = sorted(available_fields)
-
-            if FitParserService._compute_gradients(records):
-                available_fields.add("gradient")
-                fit_data.available_fields = sorted(available_fields)
+        fit_data._distance_is_fallback = not native_distance_available
+        FitParserService.rebuild_derived_metrics(
+            fit_data,
+            rebuild_distance=fit_data._distance_is_fallback,
+            filter_glitches_for_distance=fit_data._distance_is_fallback,
+            recompute_gradient=True,
+        )
 
         return fit_data
 
     @staticmethod
-    def _compute_gradients(records: list[FitRecord]) -> bool:
+    def _set_available_field(fit_data: FitData, field_name: str, present: bool):
+        fields = set(fit_data.available_fields or [])
+        if present:
+            fields.add(field_name)
+        else:
+            fields.discard(field_name)
+        fit_data.available_fields = sorted(fields)
+
+    @staticmethod
+    def rebuild_derived_metrics(
+        fit_data: FitData,
+        rebuild_distance: bool = False,
+        filter_glitches_for_distance: bool = False,
+        max_speed_ms: float = 55.0,
+        recompute_gradient: bool = True,
+    ) -> dict:
+        """统一重建派生字段：逐点 distance 回退值与 gradient。"""
+        session = fit_data.primary_session
+        if not session or not session.records:
+            fit_data.haversine_total_distance = 0.0
+            if rebuild_distance:
+                FitParserService._set_available_field(fit_data, "distance", False)
+            if recompute_gradient:
+                FitParserService._set_available_field(fit_data, "gradient", False)
+            return {
+                "distance_rebuilt": False,
+                "gradient_recomputed": False,
+                "haversine_total_distance": 0.0,
+                "glitch_filtered": filter_glitches_for_distance,
+            }
+
+        records = session.records
+        glitch_indices = set()
+        if filter_glitches_for_distance:
+            glitch_result = fit_data.get_glitch_cache(max_speed_ms=max_speed_ms)
+            glitch_indices = set(glitch_result["glitch_indices"])
+
+        cum_dist = 0.0
+        prev_coord = None
+        for idx, rec in enumerate(records):
+            has_coord = rec.latitude is not None and rec.longitude is not None
+            use_coord = has_coord and idx not in glitch_indices
+            if use_coord and prev_coord is not None:
+                step_dist = FitSanitize.haversine(
+                    prev_coord[0], prev_coord[1], rec.latitude, rec.longitude
+                )
+                if math.isfinite(step_dist) and step_dist >= 0:
+                    cum_dist += step_dist
+            if rebuild_distance:
+                rec.distance = cum_dist
+            if use_coord:
+                prev_coord = (rec.latitude, rec.longitude)
+
+        fit_data.haversine_total_distance = cum_dist
+        if rebuild_distance:
+            FitParserService._set_available_field(fit_data, "distance", True)
+
+        gradient_ok = False
+        if recompute_gradient:
+            for rec in records:
+                rec.gradient = None
+            gradient_ok = FitParserService._compute_gradients(records, force_recompute=True)
+            FitParserService._set_available_field(fit_data, "gradient", gradient_ok)
+
+        return {
+            "distance_rebuilt": rebuild_distance,
+            "gradient_recomputed": recompute_gradient,
+            "gradient_available": gradient_ok,
+            "haversine_total_distance": cum_dist,
+            "glitch_filtered": filter_glitches_for_distance,
+        }
+
+    @staticmethod
+    def _compute_gradients(records: list[FitRecord], force_recompute: bool = False) -> bool:
         """为记录预计算平滑坡度，减少渲染期重复计算与静止抖动。"""
         if not records:
             return False
@@ -390,7 +449,7 @@ class FitParserService:
         raw_values = []
         has_any = False
         for i, rec in enumerate(records):
-            raw = rec.gradient
+            raw = None if force_recompute else rec.gradient
             if raw is None:
                 raw = FitParserService._estimate_gradient(records, i)
             if raw is not None:
@@ -799,6 +858,14 @@ class FitSanitize:
         # 执行移除
         removed_indices = sorted(remove_set)
         session.records = [r for i, r in enumerate(records) if i not in remove_set]
+        fit_data.invalidate_glitch_cache()
+        FitParserService.rebuild_derived_metrics(
+            fit_data,
+            rebuild_distance=fit_data._distance_is_fallback,
+            filter_glitches_for_distance=config.gps_filter_glitches and fit_data._distance_is_fallback,
+            max_speed_ms=config.gps_max_speed_ms,
+            recompute_gradient=True,
+        )
 
         return {
             "removed_count": len(removed_indices),
@@ -1002,6 +1069,15 @@ class FitFilter:
                 setattr(r, field_name, values[i])
             smoothed.append(field_name)
 
+        if any(field in config.fields for field in ("altitude", "distance", "speed", "latitude", "longitude")):
+            fit_data.invalidate_glitch_cache()
+            FitParserService.rebuild_derived_metrics(
+                fit_data,
+                rebuild_distance=fit_data._distance_is_fallback and any(field in config.fields for field in ("latitude", "longitude")),
+                filter_glitches_for_distance=fit_data._distance_is_fallback and any(field in config.fields for field in ("latitude", "longitude")),
+                recompute_gradient=True,
+            )
+
         return {
             "smoothed_fields": smoothed,
             "method": config.method,
@@ -1092,6 +1168,15 @@ class FitFilter:
             session.records = [r for r in records
                                if all(getattr(r, f, None) is not None for f in fields)
                                or not any(getattr(r, f, None) is None for f in fields)]
+
+        if any(field in fields for field in ("altitude", "distance", "speed", "latitude", "longitude")):
+            new_data.invalidate_glitch_cache()
+            FitParserService.rebuild_derived_metrics(
+                new_data,
+                rebuild_distance=new_data._distance_is_fallback and any(field in fields for field in ("latitude", "longitude")),
+                filter_glitches_for_distance=new_data._distance_is_fallback and any(field in fields for field in ("latitude", "longitude")),
+                recompute_gradient=True,
+            )
 
         return new_data
 
