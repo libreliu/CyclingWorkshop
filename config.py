@@ -1,20 +1,15 @@
 """CyclingWorkshop 配置"""
 import os
+import shutil
 
 # 基础路径
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # FFmpeg 路径
-# python-ffmpeg 库默认查找系统 PATH 中的 ffmpeg/ffprobe
-# 如需指定路径，设置 FFMPEG_PATH / FFPROBE_PATH 环境变量
-FFMPEG_PATH = os.environ.get(
-    "FFMPEG_PATH",
-    r"C:\Projects\ffmpeg-7.1-full_build-shared\bin\ffmpeg.exe"
-)
-FFPROBE_PATH = os.environ.get(
-    "FFPROBE_PATH",
-    r"C:\Projects\ffmpeg-7.1-full_build-shared\bin\ffprobe.exe"
-)
+# 优先读取环境变量；未设置时从系统 PATH 查找；仍找不到时保留命令名，
+# 让 subprocess/PyAV 在运行时报出清晰的缺失依赖错误。
+FFMPEG_PATH = os.environ.get("FFMPEG_PATH") or shutil.which("ffmpeg") or "ffmpeg"
+FFPROBE_PATH = os.environ.get("FFPROBE_PATH") or shutil.which("ffprobe") or "ffprobe"
 
 # 数据目录
 PROJECTS_DIR = os.path.join(BASE_DIR, "saved_states")
